@@ -1,0 +1,14 @@
+# --- 코어 (헤드리스 텔레그램 봇) ---
+google-genai>=1.0.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# --- PC 활동 추적 ---
+pygetwindow>=0.0.9
+pynput>=1.7.6
+psutil>=5.9.0
+
+# --- Google 캘린더 연동 ---
+google-api-python-client>=2.100.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
