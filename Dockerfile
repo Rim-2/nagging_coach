@@ -24,8 +24,10 @@ RUN pip install --no-cache-dir -r requirements-docker.txt
 # 앱 소스 복사 (.dockerignore 가 비밀·상태 파일을 제외).
 COPY . .
 
-# state.json 등 런타임 상태는 /data 볼륨에 둔다 (STATE_PATH 로 지정).
+# state.json 등 런타임 상태는 /data 에 둔다 (STATE_PATH 로 지정).
+# 영속화는 docker-compose 의 volumes 또는 Railway Volume(마운트 경로 /data)으로
+# 처리한다. Railway 는 Dockerfile 의 VOLUME 명령을 지원하지 않으므로 쓰지 않는다.
+# 아래 mkdir 는 볼륨을 안 붙이고 실행할 때(로컬 docker run 등)를 위한 것.
 RUN mkdir -p /data
-VOLUME ["/data"]
 
 CMD ["python", "-u", "app.py"]

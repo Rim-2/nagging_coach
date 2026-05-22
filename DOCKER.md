@@ -44,6 +44,23 @@ docker compose down            # 중지
 캘린더를 쓰려면 `docker-compose.yml` 에서 `credentials.json`·`token.json`
 마운트 2줄의 주석을 해제한다. 없으면 캘린더 기능만 비활성화되고 봇은 정상 동작한다.
 
+## Railway 배포 (클라우드 상시 실행)
+
+GitHub 저장소를 연결하면 Railway 가 `Dockerfile` 로 이미지를 빌드해 배포한다.
+`docker-compose.yml` 과 `.env` 는 Railway 가 쓰지 않으므로, 아래 설정을
+Railway 대시보드에서 직접 해줘야 한다.
+
+1. **Volume 생성** — 서비스에서 `Add Volume`, 마운트 경로를 `/data` 로 지정.
+   Railway 는 Dockerfile 의 `VOLUME` 명령을 지원하지 않으므로, 영속화는
+   반드시 이 Volume 으로 한다. 없으면 재배포·재시작마다 `state.json` 이
+   날아가 텔레그램 등록·대화 기록이 초기화된다.
+2. **Variables 설정** — `.env` 대신 서비스 `Variables` 탭에 직접 입력:
+   - `GEMINI_API_KEY`
+   - `TELEGRAM_BOT_TOKEN`
+   - `STATE_PATH` = `/data/state.json`
+   - `ENABLE_PC_TRACKER` = `false` (클라우드엔 데스크톱이 없어 트래커 불가)
+   - `GEMINI_MODEL` (선택)
+
 ## 주의: 인스턴스는 하나만
 
 같은 텔레그램 봇 토큰으로 인스턴스를 둘 이상 띄우면 폴링이 충돌한다(409).
