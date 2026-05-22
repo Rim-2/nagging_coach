@@ -1,0 +1,34 @@
+# 잔소리 코치 — Docker Compose
+#
+#   docker compose up -d --build      # 빌드 후 백그라운드 실행
+#   docker compose logs -f            # 로그 보기
+#   docker compose down               # 중지
+#
+# state.json 은 ./data 에 영속화되고, 비밀·설정은 .env 에서 환경변수로 주입된다.
+
+services:
+  coach:
+    build: .
+    image: nagging-coach
+    container_name: nagging-coach
+    restart: unless-stopped
+
+    # .env 의 모든 키(GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, GEMINI_MODEL,
+    # ENABLE_PC_TRACKER)를 컨테이너 환경변수로 주입한다.
+    env_file:
+      - .env
+
+    environment:
+      # state.json 을 마운트된 /data 볼륨 안에 둔다.
+      STATE_PATH: /data/state.json
+      # 알람·리마인더 기준 타임존.
+      TZ: Asia/Seoul
+
+    volumes:
+      # state.json 영속화 — 호스트 ./data 와 컨테이너 /data 를 연결.
+      - ./data:/data
+
+      # (선택) Google 캘린더를 쓰려면 아래 2줄의 주석을 해제하세요.
+      # credentials.json·token.json 이 프로젝트 폴더에 있어야 합니다.
+      # - ./credentials.json:/app/credentials.json:ro
+      # - ./token.json:/app/token.json

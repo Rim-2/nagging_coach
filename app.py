@@ -2,7 +2,7 @@
 app.py — 잔소리 코치 (헤드리스 텔레그램 봇) 메인 진입점
 
 데스크톱 GUI 없이 백그라운드에서 동작한다:
-    [1] PC 활동을 Tracker로 감시
+    [1] PC 활동을 Tracker로 감시 (ENABLE_PC_TRACKER 일 때만)
     [2] 사용자와 텔레그램으로 대화 (CoachAgent — 대화로 목표를 끌어냄)
     [3] 딴짓이 감지되면 대화 흐름에 맞춰 잔소리 발송
     [4] 한동안 조용하면 코치가 먼저 말을 걺 (프로액티브)
@@ -11,7 +11,7 @@ app.py — 잔소리 코치 (헤드리스 텔레그램 봇) 메인 진입점
 
 스레드 구성:
     메인 스레드        살아있기만 함 (종료 신호 대기)
-    Tracker 스레드     PC 감시 → _on_trigger
+    Tracker 스레드     PC 감시 → _on_trigger  (ENABLE_PC_TRACKER 일 때만)
     텔레그램 폴링 스레드  getUpdates → _on_update
     프로액티브 스레드    일정 시간 조용하면 먼저 말 걸기
     리마인더 스레드     캘린더 일정이 곧 시작하면 미리 알림
@@ -33,9 +33,20 @@ from ai_engine import AIGenerationError, CoachAgent
 from calendar_client import CalendarClient
 from store import Store
 from telegram_client import TelegramClient
-from tracker import Snapshot, State, Tracker, TriggerType
 
 load_dotenv()
+
+# PC 활동 감시(Tracker)는 ENABLE_PC_TRACKER 환경변수로 켜고 끈다 (기본: 꺼짐).
+# 꺼져 있으면 tracker 모듈을 아예 import 하지 않는다 — 화면·입력 감시에 필요한
+# OS 의존 패키지(pygetwindow, pynput)가 없는 환경에서도 봇이 동작하도록.
+ENABLE_PC_TRACKER = os.getenv("ENABLE_PC_TRACKER", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+if ENABLE_PC_TRACKER:
+    from tracker import Snapshot, State, Tracker, TriggerType
 
 # Windows 콘솔(cp949)에서 한글·특수문자 출력이 깨지거나 죽지 않도록 UTF-8로 전환.
 for _stream in (sys.stdout, sys.stderr):
@@ -44,7 +55,8 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-STATE_PATH = os.path.join(
+# state.json 경로. STATE_PATH 환경변수로 덮어쓸 수 있다 (Docker 볼륨 등).
+STATE_PATH = os.getenv("STATE_PATH") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "state.json"
 )
 
@@ -76,10 +88,7 @@ class CoachApp:
             on_today_complete=self._on_today_complete,
             on_back_on_track=self._on_back_on_track,
         )
-        self._tracker = Tracker(
-            on_trigger=self._on_trigger,
-            get_weak_spots=lambda: self._store.weak_spots,
-        )
+        self._tracker = self._init_tracker()
 
         self._stop = threading.Event()
         self._timer_lock = threading.Lock()
@@ -107,6 +116,18 @@ class CoachApp:
         print("[App] Google 캘린더 연동 활성화됨")
         return cal
 
+    def _init_tracker(self) -> Optional["Tracker"]:
+        """PC 활동 감시(Tracker)를 준비한다. ENABLE_PC_TRACKER 가 꺼져 있으면
+        None — 감시 기능만 빠지고 텔레그램 코치 기능은 그대로 동작한다."""
+        if not ENABLE_PC_TRACKER:
+            print("[App] PC 활동 감시 비활성화 (ENABLE_PC_TRACKER=false)")
+            return None
+        print("[App] PC 활동 감시 활성화됨 (ENABLE_PC_TRACKER=true)")
+        return Tracker(
+            on_trigger=self._on_trigger,
+            get_weak_spots=lambda: self._store.weak_spots,
+        )
+
     # =============================================================== run
     def run(self) -> None:
         me = self._tg.get_me()
@@ -114,7 +135,8 @@ class CoachApp:
 
         if self._store.chat_id is not None:
             self._start_tracking()
-            print(f"[App] 기존 사용자(chat_id={self._store.chat_id}) — 추적 시작")
+            mode = "추적 시작" if self._tracker is not None else "감시 없이 대기"
+            print(f"[App] 기존 사용자(chat_id={self._store.chat_id}) — {mode}")
         else:
             print("[App] 등록된 사용자 없음 — 텔레그램에서 봇에게 /start 를 보내줘.")
 
@@ -143,7 +165,8 @@ class CoachApp:
         print("\n[App] 종료 중…")
         self._stop.set()
         self._cancel_warning_timeout()
-        self._tracker.stop()
+        if self._tracker is not None:
+            self._tracker.stop()
         self._tg.stop()
 
     # ==================================================== 텔레그램 수신
@@ -187,12 +210,17 @@ class CoachApp:
         self._store.chat_id = chat_id
         self._start_tracking()
         self._last_user_msg = time.time()
+        pc_note = (
+            "지금부터 PC도 슬쩍 지켜본다 — 딴짓하면 바로 잡으러 간다.\n"
+            if self._tracker is not None
+            else ""
+        )
         self._tg.send_message(
             chat_id,
             "안녕! 난 너의 잔소리 코치야 😎\n"
             "앞으로 여기서 같이 떠들면서 오늘 할 일 챙겨줄게. "
-            "지금부터 PC도 슬쩍 지켜본다 — 딴짓하면 바로 잡으러 간다.\n"
-            "자, 오늘 뭐 할 거야?",
+            + pc_note
+            + "자, 오늘 뭐 할 거야?",
         )
 
     def _handle_chat(self, chat_id: int, text: str) -> None:
@@ -330,16 +358,18 @@ class CoachApp:
         self._start_tracking()
 
     def _on_today_complete(self) -> None:
-        print("[App] 오늘 목표 완료 — 감시 Sleep 진입")
+        print("[App] 오늘 목표 완료")
         self._ignored_nags = 0
         self._cancel_warning_timeout()
-        self._tracker.sleep()
+        if self._tracker is not None:
+            self._tracker.sleep()
 
     def _on_back_on_track(self) -> None:
-        print("[App] 사용자 복귀 — 감시 정상화")
+        print("[App] 사용자 복귀")
         self._ignored_nags = 0
         self._cancel_warning_timeout()
-        self._tracker.resume_normal()
+        if self._tracker is not None:
+            self._tracker.resume_normal()
 
     # =================================================== Warning 타임아웃
     def _arm_warning_timeout(self) -> None:
@@ -365,7 +395,8 @@ class CoachApp:
             f"[App] 잔소리 응답 없음 (누적 무시 {self._ignored_nags}회) "
             f"— 감시 정상화"
         )
-        self._tracker.resume_normal()
+        if self._tracker is not None:
+            self._tracker.resume_normal()
 
     # ====================================================== 프로액티브
     def _proactive_loop(self) -> None:
@@ -374,7 +405,8 @@ class CoachApp:
             if chat_id is None:
                 continue
             # SLEEP(완료) 또는 WARNING(잔소리 중)이면 먼저 말 걸지 않는다.
-            if self._tracker.state != State.NORMAL:
+            # Tracker 가 꺼져 있으면 상태 개념이 없으므로 그대로 진행한다.
+            if self._tracker is not None and self._tracker.state != State.NORMAL:
                 continue
             now = time.time()
             # 사용자가 오래 답이 없을 때만 — 봇이 보낸 메시지는 침묵 타이머에
@@ -479,7 +511,10 @@ class CoachApp:
 
     # ========================================================= helpers
     def _start_tracking(self) -> None:
-        """추적 시작. 이미 돌고 있으면 무시되고, SLEEP 상태면 NORMAL 로 깨운다."""
+        """추적 시작. 이미 돌고 있으면 무시되고, SLEEP 상태면 NORMAL 로 깨운다.
+        ENABLE_PC_TRACKER 가 꺼져 있으면 아무것도 하지 않는다."""
+        if self._tracker is None:
+            return
         self._tracker.start()
         self._tracker.wake()
 

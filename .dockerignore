@@ -1,0 +1,28 @@
+# --- 비밀 파일 (런타임에 env/마운트로 주입, 이미지에 절대 포함하지 않음) ---
+.env
+.env.example
+credentials.json
+token.json
+
+# --- 런타임 상태 (마운트된 /data 볼륨에 존재) ---
+state.json
+state.json.tmp
+*_state.json
+*_state.json.tmp
+data/
+
+# --- 컨테이너에 불필요 ---
+.git
+.gitignore
+.idea
+.vscode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+start_coach.bat
+requirements.txt
+*.md
+Dockerfile
+.dockerignore
+docker-compose.yml

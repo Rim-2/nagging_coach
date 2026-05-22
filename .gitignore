@@ -9,6 +9,9 @@ state.json.tmp
 *_state.json
 *_state.json.tmp
 
+# === Docker 볼륨 (state.json 등 런타임 데이터) ===
+/data/
+
 # === 파이썬 ===
 __pycache__/
 *.pyc
