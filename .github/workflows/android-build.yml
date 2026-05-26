@@ -30,7 +30,7 @@ jobs:
 
       - name: Build Debug APK
         working-directory: ./android-satellite
-        run: gradle assembleDebug --stacktrace --info --no-daemon
+        run: gradle assembleDebug --stacktrace --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

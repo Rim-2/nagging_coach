@@ -1,5 +1,7 @@
 package com.naggingcoach.satellite;
 
+import com.naggingcoach.satellite.BuildConfig;
+
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
