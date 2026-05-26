@@ -39,12 +39,27 @@ jobs:
         if: steps.build.outcome == 'failure'
         working-directory: ./android-satellite
         run: |
-          echo "=== Compiler errors ==="
-          grep -E "error:|FAILED|Caused by|Exception in" build-output.log | head -80 || true
-          echo "=== Last 80 lines of build output ==="
-          tail -80 build-output.log
-          echo "=== End ==="
-          exit 1
+          echo "=========== ERROR LINES ============"
+          grep -nE "error:" build-output.log || echo "(no 'error:' lines)"
+          echo ""
+          echo "=========== FAILED TASKS ============"
+          grep -nE "FAILED|What went wrong" build-output.log || true
+          echo ""
+          echo "=========== LAST 120 LINES ============"
+          tail -120 build-output.log
+          echo "=========== END ============"
+
+      - name: Upload build log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: android-satellite/build-output.log
+          if-no-files-found: warn
+
+      - name: Fail if build failed
+        if: steps.build.outcome == 'failure'
+        run: exit 1
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
