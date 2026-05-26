@@ -233,10 +233,10 @@ class CoachApp:
         threading.Thread(
             target=self._proactive_loop, name="Proactive", daemon=True
         ).start()
-        if self._calendar is not None:
-            threading.Thread(
-                target=self._reminder_loop, name="Reminder", daemon=True
-            ).start()
+        # 리마인더 루프는 Google 캘린더와 봇 자체 일정 둘 다 챙기므로 항상 시작.
+        threading.Thread(
+            target=self._reminder_loop, name="Reminder", daemon=True
+        ).start()
         threading.Thread(
             target=self._alarm_loop, name="Alarm", daemon=True
         ).start()
@@ -654,29 +654,52 @@ class CoachApp:
 
     # ====================================================== 일정 리마인더
     def _reminder_loop(self) -> None:
-        """캘린더를 주기적으로 보고, 곧 시작할 일정을 미리 알려준다."""
-        reminded = set()
+        """Google 캘린더 + 봇 자체 일정 (store.events) 둘 다 챙긴다.
+        곧 시작할 일정의 reminder_lead 분 전에 미리 알림을 띄운다."""
+        reminded_google: set = set()  # Google 캘린더 이벤트 id 누적
         while not self._stop.wait(REMINDER_CHECK_INTERVAL):
             chat_id = self._store.chat_id
-            if chat_id is None or self._calendar is None:
+            if chat_id is None:
                 continue
-            try:
-                events = self._calendar.list_upcoming(max_results=10)
-            except Exception as exc:
-                print(f"[App] 일정 조회 실패: {exc}")
-                continue
-            now = datetime.datetime.now(datetime.timezone.utc)
-            for ev in events:
-                eid = ev.get("id")
-                start = self._parse_event_start(ev.get("start"))
-                if not eid or start is None or eid in reminded:
+
+            # --- Google 캘린더 (인증된 경우만) ---
+            if self._calendar is not None:
+                try:
+                    events = self._calendar.list_upcoming(max_results=10)
+                except Exception as exc:
+                    print(f"[App] 일정 조회 실패: {exc}")
+                    events = []
+                now_utc = datetime.datetime.now(datetime.timezone.utc)
+                for ev in events:
+                    eid = ev.get("id")
+                    start = self._parse_event_start(ev.get("start"))
+                    if not eid or start is None or eid in reminded_google:
+                        continue
+                    minutes = (start - now_utc).total_seconds() / 60.0
+                    if 0 < minutes <= REMINDER_LEAD_MIN:
+                        reminded_google.add(eid)
+                        self._send_event_reminder(
+                            chat_id, ev.get("summary", "일정"), int(minutes)
+                        )
+
+            # --- 봇 자체 일정 (Google 인증 무관) ---
+            now_ts = time.time()
+            for ev in self._store.events:
+                if ev.get("reminded"):
                     continue
-                minutes = (start - now).total_seconds() / 60.0
-                if 0 < minutes <= REMINDER_LEAD_MIN:
-                    reminded.add(eid)
+                start_ts = ev.get("start_ts")
+                if start_ts is None:
+                    continue
+                lead_sec = (ev.get("reminder_lead_min", 15) or 15) * 60
+                if start_ts - lead_sec <= now_ts < start_ts:
+                    minutes_left = max(0, int((start_ts - now_ts) / 60))
                     self._send_event_reminder(
-                        chat_id, ev.get("summary", "일정"), int(minutes)
+                        chat_id, ev.get("summary", "일정"), minutes_left
                     )
+                    self._store.mark_event_reminded(ev["id"])
+
+            # 지난 일정은 자동 정리 (메모리·저장 비대 방지)
+            self._store.prune_past_events()
 
     def _send_event_reminder(
         self, chat_id: int, summary: str, minutes: int

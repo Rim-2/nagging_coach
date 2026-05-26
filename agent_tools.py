@@ -8,6 +8,7 @@ agent_tools.py — 에이전트가 호출하는 '행동 도구' 레지스트리.
 """
 
 import datetime
+import time
 from typing import Callable, Dict, Optional
 
 from google.genai import types
@@ -76,6 +77,76 @@ def build_tools(
             ),
             run=lambda args: _list_calendar_events(calendar),
         )
+
+    # ---- 봇 자체 일정 (OAuth 없는 캘린더 대체) ----
+    tools["add_event"] = Tool(
+        types.FunctionDeclaration(
+            name="add_event",
+            description=(
+                "사용자가 '일정·약속·미팅·이벤트' 를 저장해달라 했을 때 봇 자체에 "
+                "등록한다. Google 캘린더와 별개 — OAuth 없이 봇 안에서 일정 관리. "
+                "정해진 시각의 reminder_lead_min 분 전에 시스템이 자동 미리 알림 "
+                "메시지를 띄운다. 단순 '시각에 한 번 알림' 만 필요하면 set_alarm "
+                "을 쓰고, '일정 자체로 저장' 해 다가오는 일정 목록에서 보고 싶을 "
+                "때만 이걸 쓴다. add_calendar_event 와도 별개 — 그건 사용자 "
+                "Google 계정 캘린더, 이건 봇 안."
+            ),
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "summary": types.Schema(
+                        type="STRING",
+                        description="일정 제목 (예: '치과 예약', '세미나')",
+                    ),
+                    "datetime": types.Schema(
+                        type="STRING",
+                        description=(
+                            "시작 시각 'YYYY-MM-DDTHH:MM'. 메시지 앞 [지금:] 표시로 "
+                            "'내일'·'금요일' 같은 상대 표현을 절대 시각 환산."
+                        ),
+                    ),
+                    "end_datetime": types.Schema(
+                        type="STRING",
+                        description="(선택) 종료 시각 'YYYY-MM-DDTHH:MM'.",
+                    ),
+                    "reminder_lead_min": types.Schema(
+                        type="INTEGER",
+                        description="(선택) 시작 N분 전에 미리 알림. 기본 15.",
+                    ),
+                },
+                required=["summary", "datetime"],
+            ),
+        ),
+        run=lambda args: _add_event(store, args),
+    )
+    tools["list_events"] = Tool(
+        types.FunctionDeclaration(
+            name="list_events",
+            description=(
+                "봇 자체에 등록된 다가오는 일정 목록 조회 (Google 캘린더 X — "
+                "그쪽은 list_calendar_events 가 따로 있다)."
+            ),
+            parameters=types.Schema(type="OBJECT", properties={}),
+        ),
+        run=lambda args: _list_events(store),
+    )
+    tools["cancel_event"] = Tool(
+        types.FunctionDeclaration(
+            name="cancel_event",
+            description="봇 자체 일정을 취소한다 (제목 키워드로 지목, 부분 일치).",
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "description": types.Schema(
+                        type="STRING",
+                        description="취소할 일정의 제목 키워드",
+                    ),
+                },
+                required=["description"],
+            ),
+        ),
+        run=lambda args: _cancel_event(store, args),
+    )
 
     # ---- 알람: 특정 시각/매일 사용자에게 잔소리를 보내달라는 예약 ----
     tools["set_alarm"] = Tool(
@@ -387,6 +458,67 @@ def _list_calendar_events(calendar) -> str:
     return "다가오는 일정 — " + "; ".join(
         f"{e['start']} {e['summary']}" for e in events
     )
+
+
+# ---------------------------------------------------------- 봇 자체 일정
+def _add_event(store, args: dict) -> str:
+    summary = str(args.get("summary", "")).strip()
+    dt_str = str(args.get("datetime", "")).strip()
+    if not summary or not dt_str:
+        return "실패: summary 와 datetime 이 모두 필요하다."
+    try:
+        start = datetime.datetime.fromisoformat(dt_str)
+    except ValueError:
+        return f"실패: datetime 형식이 잘못됨 ({dt_str!r})."
+    end_ts: Optional[float] = None
+    end_str = str(args.get("end_datetime", "")).strip()
+    if end_str:
+        try:
+            end_ts = datetime.datetime.fromisoformat(end_str).timestamp()
+        except ValueError:
+            end_ts = None
+    try:
+        lead = int(args.get("reminder_lead_min", 15))
+    except Exception:
+        lead = 15
+    lead = max(0, min(lead, 24 * 60))  # 최대 24시간
+    ev = store.add_event(
+        summary, start.timestamp(), end_ts=end_ts, reminder_lead_min=lead
+    )
+    if ev is None:
+        return "실패: 일정 등록 중 오류."
+    return (
+        f"성공: '{summary}' 일정을 {start.strftime('%Y-%m-%d %H:%M')} 에 등록. "
+        f"{lead}분 전 자동 미리 알림."
+    )
+
+
+def _list_events(store) -> str:
+    now_ts = time.time()
+    upcoming = sorted(
+        [e for e in store.events if (e.get("start_ts") or 0) >= now_ts],
+        key=lambda e: e.get("start_ts", 0),
+    )
+    if not upcoming:
+        return "등록된 다가오는 일정이 없다."
+    parts = []
+    for e in upcoming[:10]:
+        when = datetime.datetime.fromtimestamp(
+            e["start_ts"]
+        ).strftime("%Y-%m-%d %H:%M")
+        reminded = " (미리 알림 발송됨)" if e.get("reminded") else ""
+        parts.append(f"{when} — {e.get('summary')}{reminded}")
+    return "다가오는 일정: " + "; ".join(parts)
+
+
+def _cancel_event(store, args: dict) -> str:
+    desc = str(args.get("description", "")).strip()
+    if not desc:
+        return "실패: 취소할 일정 description 이 필요하다."
+    removed = store.cancel_event(desc)
+    if removed == 0:
+        return f"실패: '{desc}' 에 맞는 일정을 못 찾았다."
+    return f"성공: 일정 {removed}개 취소했다."
 
 
 # ------------------------------------------------------------ 알람 실행

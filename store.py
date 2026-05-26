@@ -13,6 +13,7 @@ store.py — 앱 상태 영속화 (state.json)
     profile           코치가 알아낸 사용자 정보 {항목: 내용, ...}
     weak_spots        자주 무너지는 앱·사이트 키워드 목록
     alarms            예약된 시간 기반 알람 [{text, repeat, next_ts, label}, ...]
+    events            봇 자체에 등록된 일정 [{id, summary, start_ts, end_ts, reminder_lead_min, reminded}]
     habits            추적 중인 습관 [{name, levels, level_idx, streak, ...}, ...]
     history           최근 대화 턴 [{role, text}, ...]
     nag_policy        잔소리 강도 — "gentle"|"balanced"|"strict" (사용자 발화로만 변경)
@@ -27,6 +28,7 @@ import datetime
 import json
 import os
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 
@@ -91,6 +93,7 @@ class Store:
             "profile": {},
             "weak_spots": [],
             "alarms": [],
+            "events": [],
             "habits": [],
             "history": [],
             "nag_policy": "balanced",
@@ -503,6 +506,76 @@ class Store:
             self._data["alarms"] = list(alarms)
             self._persist()
 
+    # ------------------------------------------------------- 봇 자체 일정
+    @property
+    def events(self) -> List[dict]:
+        """봇 자체에 등록된 일정 목록 (각 항목의 복사본). Google 캘린더와
+        별개 — OAuth 없이 봇 안에서 일정 관리가 가능하도록."""
+        with self._lock:
+            return [dict(e) for e in self._data["events"]]
+
+    def add_event(
+        self,
+        summary: str,
+        start_ts: float,
+        end_ts: Optional[float] = None,
+        reminder_lead_min: int = 15,
+    ) -> Optional[dict]:
+        """일정 등록. 반환된 dict 에 id 가 들어있어 mark/cancel 시 쓸 수 있다."""
+        summary = (summary or "").strip()
+        if not summary:
+            return None
+        with self._lock:
+            ev = {
+                "id": int(time.time() * 1000),  # ms 단위 unique
+                "summary": summary,
+                "start_ts": float(start_ts),
+                "end_ts": float(end_ts) if end_ts else None,
+                "reminder_lead_min": max(0, int(reminder_lead_min)),
+                "reminded": False,
+            }
+            self._data["events"].append(ev)
+            self._persist()
+            return dict(ev)
+
+    def mark_event_reminded(self, event_id: int) -> None:
+        with self._lock:
+            for ev in self._data["events"]:
+                if ev.get("id") == event_id:
+                    ev["reminded"] = True
+                    self._persist()
+                    return
+
+    def cancel_event(self, key_substring: str) -> int:
+        """summary 부분 일치하는 일정 제거. 반환: 제거된 갯수."""
+        key = (key_substring or "").strip().lower()
+        if not key:
+            return 0
+        with self._lock:
+            before = len(self._data["events"])
+            self._data["events"] = [
+                e for e in self._data["events"]
+                if key not in str(e.get("summary", "")).lower()
+            ]
+            removed = before - len(self._data["events"])
+            if removed:
+                self._persist()
+            return removed
+
+    def prune_past_events(self, keep_seconds_after: float = 3600.0) -> int:
+        """start_ts 가 N초 이상 지난 일정 자동 정리. 반환: 제거된 갯수."""
+        cutoff = time.time() - keep_seconds_after
+        with self._lock:
+            before = len(self._data["events"])
+            self._data["events"] = [
+                e for e in self._data["events"]
+                if (e.get("start_ts") or 0) >= cutoff
+            ]
+            removed = before - len(self._data["events"])
+            if removed:
+                self._persist()
+            return removed
+
     # --------------------------------------------------------- 습관 추적
     @property
     def habits(self) -> List[dict]:
@@ -615,6 +688,7 @@ class Store:
             self._data["profile"] = {}
             self._data["weak_spots"] = []
             self._data["alarms"] = []
+            self._data["events"] = []
             self._data["habits"] = []
             self._data["implementation_intentions"] = []
             self._persist()

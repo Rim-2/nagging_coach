@@ -23,6 +23,7 @@ import json
 import os
 import re
 import threading
+import time
 from typing import Callable, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -139,8 +140,12 @@ Plan 구체적이면 register_implementation_intention 저장. 의지력 대신 
 - 활성 도구는 [상태 메모]의 '활성 도구' 항목에 떠. **그 목록에 없는 도구는
   호출·언급도 하지 마** — 예: 캘린더 도구가 없으면 "캘린더에 넣어줄까?" 같이
   없는 기능을 권하지 마. 사용자한테 거짓 약속하지 마.
-- 캘린더·알람: 약속·시각 잡을 때 진짜 호출. "내일"·"금요일" 은 [지금:] 으로
-  절대 시각 환산.
+- 캘린더·알람·일정: 약속·시각 잡을 때 진짜 호출. "내일"·"금요일" 은 [지금:] 으로
+  절대 시각 환산. 셋은 다 다른 도구:
+  · set_alarm — 정해진 시각에 한 번 메시지 보내달라는 단순 알람 ("1시간 뒤 물").
+  · add_event — 봇 자체 일정 (Google 인증 X). 시각 N분 전 자동 미리 알림.
+    "내일 3시 회의" 같은 *일정 자체* 를 저장해 다가오는 일정 목록에서 보여줌.
+  · add_calendar_event — 활성 도구일 때만. 사용자 Google 계정 캘린더에 등록.
 - get_weekly_insight: 추세 묻기·구체 격려·캐파 가이드 필요할 때. 매번 X.
 - log_mood: 사용자가 기분·컨디션 직접 꺼낼 때만, 발화에서 1~5 짐작. 1~5점
   명시적으로 묻지 마.
@@ -349,18 +354,31 @@ class CoachAgent:
         return "[상태 메모 — 이전 대화에서 파악된 내용] " + " / ".join(parts)
 
     def _upcoming_events_summary(self) -> Optional[str]:
-        """캘린더의 다가오는 일정을 상태 요약용 한 줄로 (없거나 실패 시 None)."""
-        if self._calendar is None:
+        """다가오는 일정 한 줄 — Google 캘린더 + 봇 자체 일정 둘 다 합쳐서.
+        둘 다 비어 있거나 둘 다 실패하면 None."""
+        items: List[str] = []
+        # Google 캘린더
+        if self._calendar is not None:
+            try:
+                events = self._calendar.list_upcoming(max_results=5)
+                for e in events:
+                    items.append(f"{e['start']} {e['summary']}")
+            except Exception as exc:
+                print(f"[CoachAgent] Google 일정 조회 실패 (무시): {exc}")
+        # 봇 자체 일정
+        now_ts = time.time()
+        own = sorted(
+            [e for e in self._store.events if (e.get("start_ts") or 0) >= now_ts],
+            key=lambda e: e.get("start_ts", 0),
+        )[:5]
+        for e in own:
+            when = datetime.datetime.fromtimestamp(e["start_ts"]).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            items.append(f"{when} {e.get('summary')}")
+        if not items:
             return None
-        try:
-            events = self._calendar.list_upcoming(max_results=5)
-        except Exception as exc:
-            print(f"[CoachAgent] 일정 조회 실패 (무시): {exc}")
-            return None
-        if not events:
-            return None
-        joined = ", ".join(f"{e['start']} {e['summary']}" for e in events)
-        return f"다가오는 캘린더 일정 — {joined}"
+        return "다가오는 일정 — " + ", ".join(items)
 
     def _chat_config(self) -> types.GenerateContentConfig:
         config = types.GenerateContentConfig(
