@@ -5,16 +5,20 @@ store.py — 앱 상태 영속화 (state.json)
 모든 접근을 RLock으로 보호하고, 변경 시마다 원자적으로 파일에 쓴다.
 
 저장 항목:
-    chat_id         등록된 텔레그램 사용자
-    today_goals     오늘의 단기 목표들 (여러 개 가능)
-    long_term_goal  장기 목표
-    progress        최근 진행 상황 메모
-    next_step       지금 할 다음 구체 행동
-    profile         코치가 알아낸 사용자 정보 {항목: 내용, ...}
-    weak_spots      자주 무너지는 앱·사이트 키워드 목록
-    alarms          예약된 시간 기반 알람 [{text, repeat, next_ts, label}, ...]
-    habits          추적 중인 습관 [{name, levels, level_idx, streak, ...}, ...]
-    history         최근 대화 턴 [{role, text}, ...]
+    chat_id           등록된 텔레그램 사용자
+    today_goals       오늘의 단기 목표들 (여러 개 가능)
+    long_term_goal    장기 목표
+    progress          최근 진행 상황 메모
+    next_step         지금 할 다음 구체 행동
+    profile           코치가 알아낸 사용자 정보 {항목: 내용, ...}
+    weak_spots        자주 무너지는 앱·사이트 키워드 목록
+    alarms            예약된 시간 기반 알람 [{text, repeat, next_ts, label}, ...]
+    habits            추적 중인 습관 [{name, levels, level_idx, streak, ...}, ...]
+    history           최근 대화 턴 [{role, text}, ...]
+    nag_policy        잔소리 강도 — "gentle"|"balanced"|"strict" (사용자 발화로만 변경)
+    nag_policy_asked  첫 잔소리 직후 톤 조절 안내 노출 여부 — 한 번만 띄움
+    daily_stats       날짜별 자가 격려용 누적 카운터
+                      {YYYY-MM-DD: {triggers: {label: n}, goals_completed: n, habit_dones: n}}
 """
 
 from __future__ import annotations
@@ -24,6 +28,27 @@ import json
 import os
 import threading
 from typing import Any, Dict, List, Optional
+
+
+def _aggregate_buckets(buckets: List[dict]) -> dict:
+    """daily_stats 의 N일치 버킷을 합쳐 한 요약 dict 으로. weekly_summary 가 씀."""
+    triggers: Dict[str, int] = {}
+    goals_completed = 0
+    habit_dones = 0
+    for b in buckets:
+        for label, cnt in (b.get("triggers") or {}).items():
+            triggers[label] = triggers.get(label, 0) + int(cnt or 0)
+        goals_completed += int(b.get("goals_completed") or 0)
+        habit_dones += int(b.get("habit_dones") or 0)
+    trigger_total = sum(triggers.values())
+    top_trigger = max(triggers.items(), key=lambda x: x[1])[0] if triggers else ""
+    return {
+        "trigger_total": trigger_total,
+        "top_trigger": top_trigger,
+        "trigger_counts": triggers,
+        "goals_completed": goals_completed,
+        "habit_dones": habit_dones,
+    }
 
 
 class Store:
@@ -44,6 +69,10 @@ class Store:
             "alarms": [],
             "habits": [],
             "history": [],
+            "nag_policy": "balanced",
+            "nag_policy_asked": False,
+            "daily_stats": {},
+            "last_weekly_review": None,
         }
         self._load()
 
@@ -57,6 +86,30 @@ class Store:
             for key in self._data:
                 if key in saved:
                     self._data[key] = saved[key]
+            # today_goals 자동 마이그레이션: 옛 List[str] → 새 List[Dict].
+            # 옛 형식으로 저장된 production state 도 깨지지 않게 한 번 변환해 둔다.
+            migrated: List[dict] = []
+            for g in self._data.get("today_goals", []):
+                if isinstance(g, str):
+                    name = g.strip()
+                    if name:
+                        migrated.append(
+                            {"name": name, "sub_steps": [], "current": 0}
+                        )
+                elif isinstance(g, dict):
+                    name = str(g.get("name", "")).strip()
+                    if not name:
+                        continue
+                    migrated.append({
+                        "name": name,
+                        "sub_steps": [
+                            str(s).strip()
+                            for s in (g.get("sub_steps") or [])
+                            if str(s).strip()
+                        ],
+                        "current": int(g.get("current", 0) or 0),
+                    })
+            self._data["today_goals"] = migrated
             print(f"[Store] 상태 복원 완료: {self._path}")
         except Exception as exc:
             print(f"[Store] 상태 로드 실패 (기본값 사용): {exc}")
@@ -91,25 +144,80 @@ class Store:
 
     @property
     def today_goals(self) -> List[str]:
-        """오늘의 단기 목표 목록 (복사본)."""
+        """오늘 목표 이름 목록 (복사본) — 기존 호출자 호환 유지를 위해 이름만."""
         with self._lock:
-            return list(self._data["today_goals"])
+            return [g["name"] for g in self._data["today_goals"]]
 
-    def add_today_goal(self, goal: str) -> bool:
-        """오늘 목표를 추가한다. 이미 같은 게 있으면 False."""
+    @property
+    def today_goals_detailed(self) -> List[dict]:
+        """오늘 목표 전체 정보 (sub_steps 와 current 포함). 진척도 표시용."""
+        with self._lock:
+            return [dict(g) for g in self._data["today_goals"]]
+
+    def add_today_goal(
+        self, goal: str, sub_steps: Optional[List[str]] = None
+    ) -> bool:
+        """오늘 목표를 추가한다. 이미 같은 이름이 있으면 False.
+        sub_steps 가 있으면 단계별로 등록 — 시스템이 current 로 진척 관리."""
         goal = goal.strip()
         if not goal:
             return False
         with self._lock:
             for g in self._data["today_goals"]:
-                if g.lower() == goal.lower():
+                if g["name"].lower() == goal.lower():
                     return False
-            self._data["today_goals"].append(goal)
+            self._data["today_goals"].append({
+                "name": goal,
+                "sub_steps": [
+                    str(s).strip() for s in (sub_steps or []) if str(s).strip()
+                ],
+                "current": 0,
+            })
             self._persist()
             return True
 
+    def advance_today_goal(self, goal: str) -> Optional[dict]:
+        """sub_step 하나 완료로 표시. current += 1, 마지막을 넘기면 goal 자체를
+        완료 처리(목록에서 제거 + goals_completed 카운터 +1). sub_steps 가 없는
+        goal 이거나 일치하는 goal 이 없으면 None.
+        반환: {next_step: 다음 sub_step 또는 None, current, total, completed: bool}"""
+        key = goal.strip().lower()
+        if not key:
+            return None
+        with self._lock:
+            target = None
+            for g in self._data["today_goals"]:
+                n = g["name"].lower()
+                if n == key or key in n or n in key:
+                    target = g
+                    break
+            if target is None:
+                return None
+            sub = target.get("sub_steps") or []
+            if not sub:
+                return None
+            target["current"] = min(target.get("current", 0) + 1, len(sub))
+            completed = target["current"] >= len(sub)
+            result = {
+                "next_step": (
+                    sub[target["current"]] if not completed else None
+                ),
+                "current": target["current"],
+                "total": len(sub),
+                "completed": completed,
+            }
+            if completed:
+                bucket = self._today_bucket()
+                bucket["goals_completed"] = bucket.get("goals_completed", 0) + 1
+                self._data["today_goals"] = [
+                    g for g in self._data["today_goals"] if g is not target
+                ]
+            self._persist()
+            return result
+
     def complete_today_goal(self, goal: str) -> bool:
-        """끝낸 오늘 목표를 목록에서 제거한다 (부분 일치). 제거했으면 True."""
+        """끝낸 오늘 목표를 목록에서 제거한다 (부분 일치, name 기준). 제거했으면
+        True — 일별 통계의 goals_completed 도 함께 +1."""
         key = goal.strip().lower()
         if not key:
             return False
@@ -117,10 +225,12 @@ class Store:
             before = len(self._data["today_goals"])
             self._data["today_goals"] = [
                 g for g in self._data["today_goals"]
-                if key not in g.lower() and g.lower() not in key
+                if key not in g["name"].lower() and g["name"].lower() not in key
             ]
             changed = len(self._data["today_goals"]) != before
             if changed:
+                bucket = self._today_bucket()
+                bucket["goals_completed"] = bucket.get("goals_completed", 0) + 1
                 self._persist()
             return changed
 
@@ -177,6 +287,93 @@ class Store:
                     self._data["weak_spots"].append(item)
                     seen.add(item.lower())
             self._persist()
+
+    # --------------------------------------------------------- 일별 통계
+    DAILY_STATS_MAX_DAYS = 60     # 너무 오래된 날짜는 자동 정리 (메모리·저장 비대 방지)
+
+    def _today_bucket(self) -> dict:
+        """오늘 날짜의 통계 버킷을 (RLock 잡힌 상태에서) 가져온다 — 없으면 생성."""
+        today = datetime.date.today().isoformat()
+        stats = self._data["daily_stats"]
+        bucket = stats.get(today)
+        if bucket is None:
+            bucket = {"triggers": {}, "goals_completed": 0, "habit_dones": 0}
+            stats[today] = bucket
+            # 오래된 날짜 자동 정리
+            if len(stats) > self.DAILY_STATS_MAX_DAYS:
+                for k in sorted(stats.keys())[: len(stats) - self.DAILY_STATS_MAX_DAYS]:
+                    stats.pop(k, None)
+        return bucket
+
+    def bump_trigger_fire(self, trigger_value: str) -> None:
+        """잔소리가 실제 발송된 트리거를 오늘 자 통계에 +1. 쿨다운으로 스킵된
+        건 카운트하지 않는다 — 사용자 체감 패턴만 잡기 위함."""
+        label = (trigger_value or "").strip()
+        if not label:
+            return
+        with self._lock:
+            bucket = self._today_bucket()
+            bucket["triggers"][label] = bucket["triggers"].get(label, 0) + 1
+            self._persist()
+
+    @property
+    def daily_stats(self) -> Dict[str, dict]:
+        """일별 통계 (얕은 복사본)."""
+        with self._lock:
+            return {k: dict(v) for k, v in self._data["daily_stats"].items()}
+
+    def weekly_summary(self, days: int = 7) -> dict:
+        """최근 N일 + 그 전 N일 누적치를 비교용으로 요약.
+        반환 형태:
+            {"window_days": N,
+             "recent": {trigger_total, top_trigger, goals_completed, habit_dones},
+             "previous": {...같은 키...}}
+        """
+        today = datetime.date.today()
+        recent_dates = {
+            (today - datetime.timedelta(days=i)).isoformat() for i in range(days)
+        }
+        previous_dates = {
+            (today - datetime.timedelta(days=i)).isoformat()
+            for i in range(days, days * 2)
+        }
+        with self._lock:
+            stats = self._data["daily_stats"]
+            recent_buckets = [stats[d] for d in recent_dates if d in stats]
+            previous_buckets = [stats[d] for d in previous_dates if d in stats]
+        return {
+            "window_days": days,
+            "recent": _aggregate_buckets(recent_buckets),
+            "previous": _aggregate_buckets(previous_buckets),
+        }
+
+    # --------------------------------------------------------- 주간 회고
+    @property
+    def last_weekly_review(self) -> Optional[str]:
+        return self._get("last_weekly_review")
+
+    @last_weekly_review.setter
+    def last_weekly_review(self, value: Optional[str]) -> None:
+        self._set("last_weekly_review", value)
+
+    # --------------------------------------------------------- 잔소리 강도
+    @property
+    def nag_policy(self) -> str:
+        val = self._get("nag_policy")
+        return val if val in ("gentle", "balanced", "strict") else "balanced"
+
+    @nag_policy.setter
+    def nag_policy(self, value: str) -> None:
+        if value in ("gentle", "balanced", "strict"):
+            self._set("nag_policy", value)
+
+    @property
+    def nag_policy_asked(self) -> bool:
+        return bool(self._get("nag_policy_asked"))
+
+    @nag_policy_asked.setter
+    def nag_policy_asked(self, value: bool) -> None:
+        self._set("nag_policy_asked", bool(value))
 
     # --------------------------------------------------------- 예약 알람
     @property
@@ -267,6 +464,8 @@ class Store:
                     habit["level_idx"] = idx + 1
                     habit["level_progress"] = 0
                     leveled_up = True
+                bucket = self._today_bucket()
+                bucket["habit_dones"] = bucket.get("habit_dones", 0) + 1
                 self._persist()
 
             levels = habit.get("levels") or []

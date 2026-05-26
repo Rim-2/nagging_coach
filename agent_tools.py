@@ -8,7 +8,7 @@ agent_tools.py — 에이전트가 호출하는 '행동 도구' 레지스트리.
 """
 
 import datetime
-from typing import Callable, Dict
+from typing import Callable, Dict, Optional
 
 from google.genai import types
 
@@ -26,10 +26,15 @@ class Tool:
         self.run = run  # (args dict) -> 결과를 요약한 문자열
 
 
-def build_tools(calendar, store) -> Dict[str, Tool]:
+def build_tools(
+    calendar, store, on_goal_set: Optional[Callable[[str], None]] = None
+) -> Dict[str, Tool]:
     """현재 사용 가능한 도구 목록을 만든다.
-    calendar 가 None 이면 캘린더 도구는 빠진다 (그 능력만 비활성)."""
+    calendar 가 None 이면 캘린더 도구는 빠진다 (그 능력만 비활성).
+    on_goal_set 은 register_today_goal_with_steps 가 새 과제를 저장한 직후
+    PC 감시 wake-up 등 후처리를 트리거하기 위한 콜백."""
     tools: Dict[str, Tool] = {}
+    notify_goal_set = on_goal_set or (lambda _g: None)
 
     if calendar is not None:
         tools["add_calendar_event"] = Tool(
@@ -131,6 +136,81 @@ def build_tools(calendar, store) -> Dict[str, Tool]:
             ),
         ),
         run=lambda args: _cancel_alarm(store, args),
+    )
+
+    # ---- 단발 과제 분해: 큰 과제 → 작은 sub_step 트리로 등록 ----
+    tools["register_today_goal_with_steps"] = Tool(
+        types.FunctionDeclaration(
+            name="register_today_goal_with_steps",
+            description=(
+                "오늘 할 단발 과제 하나를 '아주 작은 행동 3~5개' 로 미리 쪼개 "
+                "등록한다. 사용자가 '코딩 1시간', '논문 쓰기', '방 정리' 같이 "
+                "큰 과제를 던지면, 한 단계 더 캐물어 작업 내용을 알아낸 뒤 이 "
+                "도구로 sub_steps 를 정해 저장해라. 각 step 은 5~15분이면 끝낼 "
+                "만큼 작게. 사용자가 한 step 끝냈다고 하면 advance_today_goal_step "
+                "으로 진척시킨다. (작은 단발 과제는 그냥 자연스러운 대화로 끝나니 "
+                "이 도구 안 써도 된다.)"
+            ),
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "name": types.Schema(
+                        type="STRING",
+                        description="과제 이름 (예: '로그인 버그 고치기')",
+                    ),
+                    "sub_steps": types.Schema(
+                        type="ARRAY",
+                        items=types.Schema(type="STRING"),
+                        description=(
+                            "작은 행동 3~5개. 첫 step 은 가장 작은 '시동 거는 "
+                            "행동'. 예: ['에러 메시지 print 추가','실행해서 출력 "
+                            "확인','원인 가설 메모','수정','테스트'] "
+                        ),
+                    ),
+                },
+                required=["name", "sub_steps"],
+            ),
+        ),
+        run=lambda args: _register_today_goal_with_steps(
+            store, args, notify_goal_set
+        ),
+    )
+    tools["advance_today_goal_step"] = Tool(
+        types.FunctionDeclaration(
+            name="advance_today_goal_step",
+            description=(
+                "register_today_goal_with_steps 로 등록된 과제의 sub_step 하나가 "
+                "끝났다고 표시한다. 사용자가 'X 했어' 처럼 한 단계만 끝났다고 "
+                "보고할 때 호출. 마지막 step 이면 과제 자체가 자동 완료된다."
+            ),
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "name": types.Schema(
+                        type="STRING",
+                        description="진척시킬 과제 이름 (부분 일치 가능)",
+                    ),
+                },
+                required=["name"],
+            ),
+        ),
+        run=lambda args: _advance_today_goal_step(store, args),
+    )
+
+    # ---- 주간 인사이트: 격려·칭찬에 구체적 근거 제공 ----
+    tools["get_weekly_insight"] = Tool(
+        types.FunctionDeclaration(
+            name="get_weekly_insight",
+            description=(
+                "지난 7일 vs 그 전 7일 활동을 비교한 인사이트를 한 줄로 받아본다 "
+                "(목표 완료·습관 수행·잔소리 트리거 발생 횟수). 사용자가 '요즘 "
+                "어땠어?', '이번 주 잘하고 있어?' 처럼 자기 추세를 물을 때, "
+                "또는 코치가 칭찬·격려를 막연한 말 대신 실제 숫자로 뒷받침하고 "
+                "싶을 때 쓴다."
+            ),
+            parameters=types.Schema(type="OBJECT", properties={}),
+        ),
+        run=lambda args: _get_weekly_insight(store),
     )
 
     # ---- 습관 등록: 난이도 레벨 단계로 쪼개서 ----
@@ -268,6 +348,82 @@ def _cancel_alarm(store, args: dict) -> str:
         return f"실패: '{desc}' 에 맞는 알람을 못 찾았다."
     store.replace_alarms(kept)
     return f"성공: 알람 {removed}개 취소했다."
+
+
+# ---------------------------------------------------------- 단발 과제 분해
+def _register_today_goal_with_steps(
+    store, args: dict, notify_goal_set: Callable[[str], None]
+) -> str:
+    name = str(args.get("name", "")).strip()
+    steps = args.get("sub_steps")
+    if not name:
+        return "실패: name 이 필요하다."
+    if not isinstance(steps, (list, tuple)) or not steps:
+        return "실패: sub_steps (작은 행동 리스트) 가 필요하다."
+    clean = [str(s).strip() for s in steps if str(s).strip()]
+    if not clean:
+        return "실패: sub_steps 가 비어 있다."
+    if store.add_today_goal(name, sub_steps=clean):
+        # PC 감시 wake-up 등 후처리 (CoachApp._on_goal_set).
+        try:
+            notify_goal_set(name)
+        except Exception as exc:
+            print(f"[agent_tools] on_goal_set 콜백 오류 (무시): {exc}")
+        return (
+            f"성공: '{name}' 을 {len(clean)}단계로 등록. "
+            f"첫 행동: '{clean[0]}'."
+        )
+    return f"이미 등록된 오늘 목표다: '{name}'."
+
+
+def _advance_today_goal_step(store, args: dict) -> str:
+    name = str(args.get("name", "")).strip()
+    if not name:
+        return "실패: name 이 필요하다."
+    result = store.advance_today_goal(name)
+    if result is None:
+        return f"실패: '{name}' 에 매칭되는 sub_step 등록 과제가 없다."
+    if result["completed"]:
+        return (
+            f"성공: '{name}' 의 마지막 단계까지 끝났어 — 과제 자체가 완료됐다. "
+            f"({result['current']}/{result['total']})"
+        )
+    return (
+        f"성공: '{name}' 진척 {result['current']}/{result['total']}. "
+        f"다음 행동: '{result['next_step']}'."
+    )
+
+
+# ---------------------------------------------------------- 주간 인사이트
+def _get_weekly_insight(store) -> str:
+    """지난 7일 vs 그 전 7일 누적 비교를 한 줄 자연어로. 코치가 칭찬·격려에
+    구체적 숫자를 녹일 수 있게 — self-efficacy 강화 목적."""
+    s = store.weekly_summary(days=7)
+    rec, prev = s["recent"], s["previous"]
+    if (
+        rec["goals_completed"] == 0
+        and rec["habit_dones"] == 0
+        and rec["trigger_total"] == 0
+    ):
+        return "최근 7일 활동 데이터가 아직 충분하지 않다."
+
+    def _delta(now: int, before: int) -> str:
+        d = now - before
+        if d > 0:
+            return f"+{d}"
+        if d < 0:
+            return str(d)
+        return "±0"
+
+    return (
+        f"최근 7일 — 목표 완료 {rec['goals_completed']}회 "
+        f"({_delta(rec['goals_completed'], prev['goals_completed'])}), "
+        f"습관 수행 {rec['habit_dones']}회 "
+        f"({_delta(rec['habit_dones'], prev['habit_dones'])}), "
+        f"잔소리 트리거 {rec['trigger_total']}회 "
+        f"({_delta(rec['trigger_total'], prev['trigger_total'])}, 적을수록 좋음). "
+        f"가장 자주 잡힌 패턴: '{rec['top_trigger'] or '-'}'."
+    )
 
 
 # ------------------------------------------------------------ 습관 실행
