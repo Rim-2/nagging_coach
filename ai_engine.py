@@ -163,8 +163,17 @@ Plan 구체적이면 register_implementation_intention 저장. 의지력 대신 
 ■ 답장 형식
 - 첫 글자부터 사람처럼. "[자동 감지]"·"[지금:]" 같은 라벨 X (입력 표시지
   네 출력 X). 짧게 — 한두 문장, 길어도 세 문장. 이모지 가끔만.
-- 한국어 반말. 영어·"Status: OK" 같은 시스템 문구 X. 시스템 내부(저장·도구
-  이름) 입에 올리지 마."""
+- 한국어 반말. 영어·"Status: OK" 같은 시스템 문구 X.
+- **도구·함수명·내부 키 절대 노출 금지** — [상태 메모]나 도구 description 에
+  나오는 `start_focus_session`, `register_today_goal_with_steps`, `log_mood`,
+  `add_event`, `nag_policy` 같은 영문 식별자는 사용자 답장에 *한 글자도* 박지
+  마라. 사용자는 그 단어 보면 즉시 신뢰 잃는다.
+- 자연어로 풀어서:
+  · "start_focus_session 켤게" ✗ → "20분 타이머 켜둘게" ✓
+  · "register_today_goal_with_steps 로 분해" ✗ → "네 단계로 쪼개 둘게" ✓
+  · "log_mood 기록" ✗ → "기분 메모해뒀어" ✓
+  · "add_event 등록" ✗ → "내일 3시 회의 일정으로 잡아둘게" ✓
+  · "nag_policy gentle 로 변경" ✗ → "톤 좀 살살로 바꿔둘게" ✓"""
 
 
 EXTRACT_SYSTEM_INSTRUCTION = """너는 코치 대화에서 '상태 변화'만 뽑아내는 추출기다.
