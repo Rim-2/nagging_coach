@@ -72,6 +72,14 @@ ALARM_CHECK_INTERVAL = 30.0       # 예약 알람 점검 주기
 WEEKLY_REVIEW_HOUR = 21           # 매주 일요일 N시에 주간 회고 ritual
 WEEKLY_REVIEW_CHECK_INTERVAL = 300.0  # 5분 주기로 시각 체크 (21:00~21:59 사이 1회)
 
+# 과부하 자체 점검 — 잔소리가 N회 연속 무시되고 사용자가 한참 답 없을 때,
+# 코치가 '톤이 빡센가, 목표가 무거운가' 한 번 물어봐 자기결정권 돌려주기.
+# 자기인식 부재로 strict 톤을 고집하거나 캐파 오버 목표로 반복 실패하는
+# 케이스의 안전망. 발사 후 3일은 쿨다운.
+OVERLOAD_IGNORED_THRESHOLD = 5
+OVERLOAD_SILENCE_SEC = 86400.0       # 사용자가 24시간 응답 없음
+OVERLOAD_COOLDOWN_SEC = 86400.0 * 3  # 같은 사용자에게 3일 안엔 안 띄움
+
 # ── 자동 복구 (Railway가 컨테이너를 자동 재시작하는 걸 이용) ─────────────
 # A) 텔레그램 발송이 연속 N회 실패하면 컨테이너 자살 → Railway가 재시작.
 #    네트워크 누적 문제로 send가 막힐 때 사람 개입 없이 복구하기 위함.
@@ -611,6 +619,18 @@ class CoachApp:
             if now - self._last_proactive < PROACTIVE_IDLE_SEC:
                 continue
             self._last_proactive = now  # 성공·실패 무관하게 한동안 재시도 안 함
+            # 과부하 자체 점검 우선 — 시그널 충족하면 평소 프로액티브 대신
+            # '톤·목표 점검' 메시지를 띄운다 (자기결정권 보존, 자동 적용 X).
+            if self._should_check_overload(now):
+                try:
+                    reply = self._agent.overload_checkin()
+                except AIGenerationError as exc:
+                    print(f"[App] 과부하 점검 생성 실패: {exc}")
+                    continue
+                print("[App] 과부하 점검 메시지 발송")
+                if self._send(chat_id, reply):
+                    self._store.last_overload_checkin = now
+                continue
             try:
                 reply = self._agent.proactive_checkin()
             except AIGenerationError as exc:
@@ -618,6 +638,18 @@ class CoachApp:
                 continue
             print("[App] 프로액티브 메시지 발송")
             self._send(chat_id, reply)
+
+    def _should_check_overload(self, now: float) -> bool:
+        """과부하 점검 메시지를 띄울 시그널 충족 여부.
+        조건: 잔소리 누적 무시 ≥ N회 + 사용자가 24h 응답 없음 + 3일 쿨다운."""
+        if self._ignored_nags < OVERLOAD_IGNORED_THRESHOLD:
+            return False
+        if now - self._last_user_msg < OVERLOAD_SILENCE_SEC:
+            return False
+        last = self._store.last_overload_checkin
+        if last is not None and (now - last) < OVERLOAD_COOLDOWN_SEC:
+            return False
+        return True
 
     # ====================================================== 일정 리마인더
     def _reminder_loop(self) -> None:

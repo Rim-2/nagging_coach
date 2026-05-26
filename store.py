@@ -34,19 +34,27 @@ def _aggregate_buckets(buckets: List[dict]) -> dict:
     """daily_stats 의 N일치 버킷을 합쳐 한 요약 dict 으로. weekly_summary 가 씀."""
     triggers: Dict[str, int] = {}
     goals_completed = 0
+    goals_registered = 0
     habit_dones = 0
     for b in buckets:
         for label, cnt in (b.get("triggers") or {}).items():
             triggers[label] = triggers.get(label, 0) + int(cnt or 0)
         goals_completed += int(b.get("goals_completed") or 0)
+        goals_registered += int(b.get("goals_registered") or 0)
         habit_dones += int(b.get("habit_dones") or 0)
     trigger_total = sum(triggers.values())
     top_trigger = max(triggers.items(), key=lambda x: x[1])[0] if triggers else ""
+    # 완료율은 분모(등록) 가 0 이면 None — '데이터 부족'으로 표시할 수 있게.
+    completion_rate: Optional[float] = (
+        goals_completed / goals_registered if goals_registered > 0 else None
+    )
     return {
         "trigger_total": trigger_total,
         "top_trigger": top_trigger,
         "trigger_counts": triggers,
         "goals_completed": goals_completed,
+        "goals_registered": goals_registered,
+        "completion_rate": completion_rate,
         "habit_dones": habit_dones,
     }
 
@@ -73,6 +81,7 @@ class Store:
             "nag_policy_asked": False,
             "daily_stats": {},
             "last_weekly_review": None,
+            "last_overload_checkin": None,
         }
         self._load()
 
@@ -173,6 +182,10 @@ class Store:
                 ],
                 "current": 0,
             })
+            # 캐파 분모 — '오늘 시도한 일'이 얼마나 되는지. 완료/시도 비율을
+            # weekly_summary 가 보고 코치가 사용자 캐파에 맞게 분량을 조절.
+            bucket = self._today_bucket()
+            bucket["goals_registered"] = bucket.get("goals_registered", 0) + 1
             self._persist()
             return True
 
@@ -297,7 +310,12 @@ class Store:
         stats = self._data["daily_stats"]
         bucket = stats.get(today)
         if bucket is None:
-            bucket = {"triggers": {}, "goals_completed": 0, "habit_dones": 0}
+            bucket = {
+                "triggers": {},
+                "goals_completed": 0,
+                "goals_registered": 0,
+                "habit_dones": 0,
+            }
             stats[today] = bucket
             # 오래된 날짜 자동 정리
             if len(stats) > self.DAILY_STATS_MAX_DAYS:
@@ -355,6 +373,16 @@ class Store:
     @last_weekly_review.setter
     def last_weekly_review(self, value: Optional[str]) -> None:
         self._set("last_weekly_review", value)
+
+    # ----------------------------------------------------- 과부하 자체 점검
+    @property
+    def last_overload_checkin(self) -> Optional[float]:
+        """가장 최근 'overload checkin'(코치가 톤·목표 크기 의사 확인) 발사 시각."""
+        return self._get("last_overload_checkin")
+
+    @last_overload_checkin.setter
+    def last_overload_checkin(self, value: Optional[float]) -> None:
+        self._set("last_overload_checkin", value)
 
     # --------------------------------------------------------- 잔소리 강도
     @property

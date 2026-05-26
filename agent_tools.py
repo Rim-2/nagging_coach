@@ -397,13 +397,14 @@ def _advance_today_goal_step(store, args: dict) -> str:
 # ---------------------------------------------------------- 주간 인사이트
 def _get_weekly_insight(store) -> str:
     """지난 7일 vs 그 전 7일 누적 비교를 한 줄 자연어로. 코치가 칭찬·격려에
-    구체적 숫자를 녹일 수 있게 — self-efficacy 강화 목적."""
+    구체적 숫자를 녹이고, 새 과제 분량 결정에 캐파 가이드를 받기 위함."""
     s = store.weekly_summary(days=7)
     rec, prev = s["recent"], s["previous"]
     if (
         rec["goals_completed"] == 0
         and rec["habit_dones"] == 0
         and rec["trigger_total"] == 0
+        and rec.get("goals_registered", 0) == 0
     ):
         return "최근 7일 활동 데이터가 아직 충분하지 않다."
 
@@ -415,8 +416,19 @@ def _get_weekly_insight(store) -> str:
             return str(d)
         return "±0"
 
+    rate = rec.get("completion_rate")
+    if rate is None:
+        rate_line = "목표 완료율: 데이터 부족"
+    else:
+        rate_line = (
+            f"목표 완료율: {int(rate * 100)}% "
+            f"({rec['goals_completed']}/{rec['goals_registered']})"
+            f"{ ' — 캐파에 비해 분량이 과한 신호, 다음 과제는 더 잘게 쪼개라' if rate < 0.4 else '' }"
+        )
+
     return (
-        f"최근 7일 — 목표 완료 {rec['goals_completed']}회 "
+        f"최근 7일 — {rate_line}; "
+        f"목표 완료 {rec['goals_completed']}회 "
         f"({_delta(rec['goals_completed'], prev['goals_completed'])}), "
         f"습관 수행 {rec['habit_dones']}회 "
         f"({_delta(rec['habit_dones'], prev['habit_dones'])}), "
