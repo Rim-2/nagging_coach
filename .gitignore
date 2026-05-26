@@ -26,3 +26,13 @@ Thumbs.db
 
 # === 로컬 위성 실행 로그 (Windows 시작프로그램에서 자동 실행될 때 stdout 받아둠) ===
 satellite.log
+
+# === Android 위성 빌드 산출물 ===
+android-satellite/.gradle/
+android-satellite/build/
+android-satellite/app/build/
+android-satellite/local.properties
+android-satellite/.idea/
+android-satellite/captures/
+android-satellite/*.iml
+android-satellite/.cxx/

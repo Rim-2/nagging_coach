@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">잔소리 코치 위성</string>
+    <string name="status_initial">권한 확인 중…</string>
+    <string name="btn_permission">1단계. Usage Access 권한 켜기</string>
+    <string name="btn_start">2단계. 위성 시작</string>
+    <string name="note">백그라운드에서 폰의 약점 앱 사용 시간이 임계치를 넘으면, 메인 봇(텔레그램)으로 트리거를 보낸다. 배터리 최적화 제외 / 자동 시작 허용해두면 안정적.</string>
+</resources>
