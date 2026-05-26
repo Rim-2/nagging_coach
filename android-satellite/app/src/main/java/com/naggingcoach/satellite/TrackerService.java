@@ -45,10 +45,11 @@ public class TrackerService extends Service {
 
     private static final long POLL_INTERVAL_MS = 60_000L;       // 1분 폴링
     private static final long WINDOW_MS = 6 * 60 * 60_000L;     // 최근 6시간 사용량 조회
-    private static final long LOCAL_COOLDOWN_MS = 5 * 60_000L;  // 같은 (트리거,앱) 5분 쿨다운
+    // ▼ DEMO: 같은 트리거 5분 쿨다운 → 90초 (시연 여러 번 가능). 정상 운영 5분.
+    private static final long LOCAL_COOLDOWN_MS = 90_000L;
 
-    // 능동적 도파민 스크롤 — 영상·SNS 앱 N분 이상 누적
-    private static final long DOPAMINE_THRESHOLD_MS = 15 * 60_000L;
+    // ▼ DEMO: 능동적 도파민 스크롤 15분 → 1분 (시연용). 정상 운영 15 * 60_000L.
+    private static final long DOPAMINE_THRESHOLD_MS = 1 * 60_000L;
     private static final String[] DOPAMINE_APPS = {
             "com.instagram.android",
             "com.google.android.youtube",
@@ -60,8 +61,8 @@ public class TrackerService extends Service {
             "com.snapchat.android",
     };
 
-    // 과몰입 딴짓 — 게임·메신저류 30분 이상 누적
-    private static final long ADDICTIVE_THRESHOLD_MS = 30 * 60_000L;
+    // ▼ DEMO: 과몰입 딴짓 30분 → 2분 (시연용). 정상 운영 30 * 60_000L.
+    private static final long ADDICTIVE_THRESHOLD_MS = 2 * 60_000L;
     private static final String[] ADDICTIVE_APPS = {
             "com.kakao.talk",
             "com.discord",
