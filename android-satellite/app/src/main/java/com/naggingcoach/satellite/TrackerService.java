@@ -11,14 +11,19 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.util.Log;
 
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.Calendar;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -62,9 +67,23 @@ public class TrackerService extends Service {
             "com.linecorp.linelite",
     };
 
+    // 휴식 없는 과로 — 화면 ON 누적 N분 (5분 OFF 가 휴식 인정)
+    private static final int OVERWORK_THRESHOLD_MIN = 120;
+    private static final int BREAK_MIN = 5;
+
+    // 늦은 밤 — 새벽 N~M시 + 화면 ON. 하루 한 번만.
+    private static final int LATE_NIGHT_START_HOUR = 1;
+    private static final int LATE_NIGHT_END_HOUR = 5;
+
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Map<String, Long> lastFireMs = new HashMap<>();
     private UsageStatsManager usm;
+    private PowerManager pm;
+
+    // 화면 ON/OFF 누적 추적 (분 단위, POLL_INTERVAL_MS 가 1분이라 그냥 1씩)
+    private int sustainedUseMin = 0;
+    private int offStreakMin = 0;
+    private String lateNightFiredOnDate = "";  // "yyyy-MM-dd"
 
     private final Runnable poller = new Runnable() {
         @Override
@@ -82,6 +101,7 @@ public class TrackerService extends Service {
     public void onCreate() {
         super.onCreate();
         usm = (UsageStatsManager) getSystemService(USAGE_STATS_SERVICE);
+        pm = (PowerManager) getSystemService(POWER_SERVICE);
         createNotificationChannel();
     }
 
@@ -109,6 +129,39 @@ public class TrackerService extends Service {
     // ============================================================ 폴링
     private void check() {
         long now = System.currentTimeMillis();
+
+        // --- 화면 ON/OFF 누적 (휴식 없는 과로 + 늦은 밤 트리거 둘 다 씀) ---
+        boolean screenOn = (pm != null) && pm.isInteractive();
+        if (screenOn) {
+            sustainedUseMin++;
+            offStreakMin = 0;
+        } else {
+            offStreakMin++;
+            if (offStreakMin >= BREAK_MIN) {
+                // BREAK_MIN 이상 화면 OFF = 휴식으로 인정, 누적 리셋
+                sustainedUseMin = 0;
+            }
+        }
+
+        // --- 휴식 없는 과로: 화면 ON 누적 N분 ---
+        if (sustainedUseMin >= OVERWORK_THRESHOLD_MIN) {
+            tryFire("휴식 없는 과로", "phone-screen", sustainedUseMin * 60_000L, now);
+            sustainedUseMin = 0;  // 발사 후 누적 리셋
+        }
+
+        // --- 늦은 밤: 새벽 시간대 + 화면 ON + 하루 한 번만 ---
+        Calendar cal = Calendar.getInstance();
+        int hour = cal.get(Calendar.HOUR_OF_DAY);
+        String today = new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(new Date());
+        if (screenOn
+                && hour >= LATE_NIGHT_START_HOUR
+                && hour < LATE_NIGHT_END_HOUR
+                && !today.equals(lateNightFiredOnDate)) {
+            lateNightFiredOnDate = today;
+            tryFire("늦은 밤", "phone-screen", 0L, now);
+        }
+
+        // --- 앱 사용 시간 기반 트리거 (능동 도파민 / 과몰입) ---
         List<UsageStats> stats = usm.queryUsageStats(
                 UsageStatsManager.INTERVAL_DAILY, now - WINDOW_MS, now);
         if (stats == null || stats.isEmpty()) {
