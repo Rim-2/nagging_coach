@@ -79,6 +79,11 @@ DAILY_RESTART_HOUR = 4
 DAILY_RESTART_MIN_UPTIME_HOURS = 23
 DAILY_RESTART_CHECK_INTERVAL = 300.0  # 5분 주기로 시각 체크
 
+# 원격 위성 트리거 쿨다운. 위성은 자체 60초 쿨다운만 가져서, idle/dwell 기반 트리거
+# (도파민 좀비, 가짜 일하기, 개인 약점 앱)는 조건이 계속 참이면 1~2분마다 또 발사될
+# 수 있음. 같은 트리거 종류는 클라우드가 권위 있게 N분 막아 잔소리 폭주를 차단.
+REMOTE_TRIGGER_COOLDOWN_SEC = 600.0
+
 
 class _TriggerHTTPHandler(http.server.BaseHTTPRequestHandler):
     """원격 PC 트래커 위성(trigger_satellite.py)에서 보내는 트리거를 받는
@@ -168,6 +173,8 @@ class CoachApp:
         self._consecutive_tg_failures = 0    # 텔레그램 발송 연속 실패 카운터 (자동 재시작용)
         self._started_at = time.time()       # 컨테이너 시작 시각 (매일 재시작 판단용)
         self._ignored_nags = 0               # 연속으로 무시당한 잔소리 횟수
+        self._remote_cooldowns: dict[str, float] = {}  # trigger_value → 다음 발동 가능 시각
+        self._remote_cooldown_lock = threading.Lock()
 
     @staticmethod
     def _init_calendar() -> Optional[CalendarClient]:
@@ -446,6 +453,19 @@ class CoachApp:
         if not trigger_value:
             return {"ok": False, "action": "skipped", "reason": "missing_trigger"}
 
+        # 같은 트리거 종류는 N분 쿨다운 — 위성 60초 쿨다운으론 idle/dwell 기반
+        # 트리거가 연발되는 걸 못 막아서, 여기서 권위 있게 한 번 더 걸러낸다.
+        now = time.time()
+        with self._remote_cooldown_lock:
+            next_ok = self._remote_cooldowns.get(trigger_value, 0.0)
+        if now < next_ok:
+            remaining = int(next_ok - now)
+            print(
+                f"[App] (원격) 트리거 [{trigger_value}] 쿨다운 중 "
+                f"({remaining}s 남음) — 스킵"
+            )
+            return {"ok": True, "action": "skipped", "reason": "cooldown"}
+
         chat_id = self._store.chat_id
         if chat_id is None:
             return {"ok": False, "action": "skipped", "reason": "no_user_registered"}
@@ -483,6 +503,10 @@ class CoachApp:
         print(f"[App] (원격) 트리거 [{trigger_value}] → 잔소리 발송")
         self._send(chat_id, reply)
         self._arm_warning_timeout()
+        with self._remote_cooldown_lock:
+            self._remote_cooldowns[trigger_value] = (
+                time.time() + REMOTE_TRIGGER_COOLDOWN_SEC
+            )
         return {"ok": True, "action": "nag_sent"}
 
     # ====================================================== 도구 콜백
