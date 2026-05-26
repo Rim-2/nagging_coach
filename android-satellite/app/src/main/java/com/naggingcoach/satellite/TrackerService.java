@@ -260,7 +260,7 @@ public class TrackerService extends Service {
         }
         return b.setContentTitle("잔소리 코치")
                 .setContentText(text)
-                .setSmallIcon(android.R.drawable.stat_sys_data_usage)
+                .setSmallIcon(android.R.drawable.sym_def_app_icon)
                 .setOngoing(true)
                 .build();
     }
