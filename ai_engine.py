@@ -330,10 +330,18 @@ class CoachAgent:
             parts.append(events_line)
         intentions = self._store.implementation_intentions
         if intentions:
+            # 컨텍스트 비대 방지 — 최근 10개만 노출. 사용자가 100개 쌓아도
+            # 시스템 프롬프트가 폭주하지 않게.
+            recent = intentions[-10:]
             ii_lines = [
-                f"'{p['situation']}' → '{p['response']}'" for p in intentions
+                f"'{p['situation']}' → '{p['response']}'" for p in recent
             ]
-            parts.append("미리 정해둔 if-then plan — " + "; ".join(ii_lines))
+            note = (
+                f"미리 정해둔 if-then plan (최근 {len(recent)}/{len(intentions)})"
+                if len(intentions) > 10
+                else "미리 정해둔 if-then plan"
+            )
+            parts.append(f"{note} — " + "; ".join(ii_lines))
         habits = self._store.habits
         if habits:
             today = datetime.date.today().isoformat()

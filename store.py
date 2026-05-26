@@ -663,6 +663,39 @@ class Store:
                 "leveled_up": leveled_up,
             }
 
+    def cancel_habit(self, name: str) -> int:
+        """습관 제거 (부분 일치). 반환: 제거 갯수."""
+        key = (name or "").strip().lower()
+        if not key:
+            return 0
+        with self._lock:
+            before = len(self._data["habits"])
+            self._data["habits"] = [
+                h for h in self._data["habits"]
+                if key not in str(h.get("name", "")).lower()
+            ]
+            removed = before - len(self._data["habits"])
+            if removed:
+                self._persist()
+            return removed
+
+    def cancel_today_goal(self, name: str) -> bool:
+        """오늘 목표를 *취소* (완료가 아닌 단순 삭제). complete_today_goal 과
+        다름 — daily_stats.goals_completed 카운터 안 올림."""
+        key = (name or "").strip().lower()
+        if not key:
+            return False
+        with self._lock:
+            before = len(self._data["today_goals"])
+            self._data["today_goals"] = [
+                g for g in self._data["today_goals"]
+                if key not in g["name"].lower() and g["name"].lower() not in key
+            ]
+            changed = len(self._data["today_goals"]) != before
+            if changed:
+                self._persist()
+            return changed
+
     # --------------------------------------------------------- 대화 기록
     @property
     def history(self) -> List[Dict[str, str]]:

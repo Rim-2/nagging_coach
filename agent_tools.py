@@ -209,6 +209,73 @@ def build_tools(
         run=lambda args: _cancel_alarm(store, args),
     )
 
+    # ---- 취소 도구들: 사용자가 명시적으로 그만하겠다 할 때 ----
+    tools["cancel_today_goal"] = Tool(
+        types.FunctionDeclaration(
+            name="cancel_today_goal",
+            description=(
+                "사용자가 오늘 목표를 *그만두겠다*·*포기한다* 고 말할 때 호출. "
+                "완료(complete) 와 다름 — 단순 취소로 통계 카운터에 안 잡힘. "
+                "사용자가 '이거 안 할래' 같이 명시적으로 빼고 싶다 했을 때만."
+            ),
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "name": types.Schema(
+                        type="STRING",
+                        description="취소할 오늘 목표 이름 (부분 일치 가능)",
+                    ),
+                },
+                required=["name"],
+            ),
+        ),
+        run=lambda args: _cancel_today_goal(store, args),
+    )
+    tools["cancel_habit"] = Tool(
+        types.FunctionDeclaration(
+            name="cancel_habit",
+            description=(
+                "사용자가 등록한 습관을 그만두겠다 할 때 호출. 'OO 습관은 그만' "
+                "처럼 명시적 요청 시만. streak·진척 기록 다 같이 사라짐."
+            ),
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "name": types.Schema(
+                        type="STRING",
+                        description="취소할 습관 이름 (부분 일치)",
+                    ),
+                },
+                required=["name"],
+            ),
+        ),
+        run=lambda args: _cancel_habit(store, args),
+    )
+    tools["cancel_implementation_intention"] = Tool(
+        types.FunctionDeclaration(
+            name="cancel_implementation_intention",
+            description=(
+                "register_implementation_intention 으로 등록된 if-then plan 을 "
+                "취소한다 (situation 또는 response 키워드로 지목). 사용자가 "
+                "'그 plan 빼' 같이 명시 요청 시만."
+            ),
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "key": types.Schema(
+                        type="STRING",
+                        description=(
+                            "취소할 plan 의 situation 또는 response 키워드 "
+                            "(부분 일치)"
+                        ),
+                    ),
+                },
+                required=["key"],
+            ),
+        ),
+        run=lambda args: _cancel_implementation_intention(store, args),
+    )
+
     # ---- 단발 과제 분해: 큰 과제 → 작은 sub_step 트리로 등록 ----
     tools["register_today_goal_with_steps"] = Tool(
         types.FunctionDeclaration(
@@ -639,6 +706,36 @@ def _advance_today_goal_step(store, args: dict) -> str:
         f"성공: '{name}' 진척 {result['current']}/{result['total']}. "
         f"다음 행동: '{result['next_step']}'."
     )
+
+
+# ---------------------------------------------------------- 취소 도구
+def _cancel_today_goal(store, args: dict) -> str:
+    name = str(args.get("name", "")).strip()
+    if not name:
+        return "실패: name 이 필요하다."
+    if store.cancel_today_goal(name):
+        return f"성공: 오늘 목표 '{name}' 취소했어 (완료 아님, 단순 제거)."
+    return f"실패: '{name}' 에 맞는 오늘 목표를 못 찾았어."
+
+
+def _cancel_habit(store, args: dict) -> str:
+    name = str(args.get("name", "")).strip()
+    if not name:
+        return "실패: name 이 필요하다."
+    removed = store.cancel_habit(name)
+    if removed == 0:
+        return f"실패: '{name}' 에 맞는 습관을 못 찾았어."
+    return f"성공: 습관 {removed}개 취소했어 (streak·진척 같이 사라짐)."
+
+
+def _cancel_implementation_intention(store, args: dict) -> str:
+    key = str(args.get("key", "")).strip()
+    if not key:
+        return "실패: key 가 필요하다."
+    removed = store.remove_implementation_intention(key)
+    if removed == 0:
+        return f"실패: '{key}' 에 맞는 if-then plan 을 못 찾았어."
+    return f"성공: if-then plan {removed}개 취소했어."
 
 
 # ---------------------------------------------------- Implementation intention
