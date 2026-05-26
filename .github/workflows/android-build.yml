@@ -25,14 +25,17 @@ jobs:
         with:
           cmdline-tools-version: 11076708
 
-      - name: Setup Gradle
+      - name: Setup Gradle 8.5 (AGP 8.2.2 호환)
         uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
 
       - name: Build Debug APK
         id: build
         working-directory: ./android-satellite
         continue-on-error: true
         run: |
+          gradle --version
           gradle assembleDebug --stacktrace --no-daemon 2>&1 | tee build-output.log
 
       - name: Show compiler errors only (if build failed)
