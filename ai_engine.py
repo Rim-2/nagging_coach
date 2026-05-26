@@ -828,7 +828,9 @@ class CoachAgent:
     def _build_pattern_analysis(self, days: int) -> str:
         """최근 N일 daily_stats 를 자연어로 풀어 LLM 에 던지고, 의미 있는 패턴
         3~5개를 자연어로 받아온다. agent_tools 의 analyze_my_patterns 도구가
-        이 메서드를 콜백으로 호출."""
+        이 메서드를 콜백으로 호출 — 그 호출 경로가 이미 _lock 잡힌 상태이므로
+        여기선 lock 잡지 않는다 (재진입 deadlock 방지). store 메서드는 자체
+        RLock 으로 thread-safe."""
         days = max(1, min(int(days or 30), 90))
         stats = self._store.daily_stats
         if not stats:

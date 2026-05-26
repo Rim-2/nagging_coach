@@ -115,6 +115,23 @@ DAILY_RESTART_CHECK_INTERVAL = 300.0  # 5분 주기로 시각 체크
 # 수 있음. 같은 트리거 종류는 클라우드가 권위 있게 N분 막아 잔소리 폭주를 차단.
 REMOTE_TRIGGER_COOLDOWN_SEC = 600.0
 
+# 폰 위성이 보내는 Android 패키지명을 사람이 읽는 라벨로. 매핑에 없으면 그대로.
+_PHONE_APP_LABELS = {
+    "com.instagram.android": "인스타그램",
+    "com.google.android.youtube": "유튜브",
+    "com.zhiliaoapp.musically": "틱톡",
+    "com.ss.android.ugc.trill": "틱톡",
+    "com.facebook.katana": "페이스북",
+    "com.twitter.android": "X(트위터)",
+    "com.reddit.frontpage": "레딧",
+    "com.snapchat.android": "스냅챗",
+    "com.kakao.talk": "카카오톡",
+    "com.discord": "디스코드",
+    "com.nhn.android.band": "밴드",
+    "com.linecorp.linelite": "라인",
+    "phone-screen": "휴대폰",
+}
+
 
 class _TriggerHTTPHandler(http.server.BaseHTTPRequestHandler):
     """원격 PC 트래커 위성(trigger_satellite.py)에서 보내는 트리거를 받는
@@ -532,7 +549,10 @@ class CoachApp:
         진단적 라벨은 코드 식별자(enum)에만 남기고 LLM 컨텍스트엔 넣지 않는다.
         라벨이 노출되면 코치 답장 톤이 진단·낙인 쪽으로 끌려가서 무너져 있는
         사용자한테 역효과."""
-        win = snap.get("active_window") or "(알 수 없는 창)"
+        raw_win = snap.get("active_window") or "(알 수 없는 창)"
+        # 폰 위성이 보낸 Android 패키지명이면 사람이 읽는 이름으로 (PC 의 sanitize
+        # 라벨이나 raw 창 제목은 그대로 통과).
+        win = _PHONE_APP_LABELS.get(raw_win, raw_win)
         idle_min = int((snap.get("idle_time") or 0) // 60)
         switch_count = snap.get("switch_count") or 0
         # 폰 위성은 실제 세션 분을 보냄. PC 위성은 안 보냄 → None.
