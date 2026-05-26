@@ -563,13 +563,17 @@ class Store:
             return removed
 
     def prune_past_events(self, keep_seconds_after: float = 3600.0) -> int:
-        """start_ts 가 N초 이상 지난 일정 자동 정리. 반환: 제거된 갯수."""
+        """일정이 끝나고 N초 이상 지난 것 자동 정리. end_ts 가 있으면 그 기준,
+        없으면 start_ts 기준 — 진행 중인 긴 일정이 prune 되지 않도록.
+        반환: 제거된 갯수."""
         cutoff = time.time() - keep_seconds_after
         with self._lock:
             before = len(self._data["events"])
+            def _is_kept(e: dict) -> bool:
+                effective_end = e.get("end_ts") or e.get("start_ts") or 0
+                return effective_end >= cutoff
             self._data["events"] = [
-                e for e in self._data["events"]
-                if (e.get("start_ts") or 0) >= cutoff
+                e for e in self._data["events"] if _is_kept(e)
             ]
             removed = before - len(self._data["events"])
             if removed:

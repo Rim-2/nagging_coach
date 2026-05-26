@@ -470,11 +470,22 @@ def _add_event(store, args: dict) -> str:
         start = datetime.datetime.fromisoformat(dt_str)
     except ValueError:
         return f"실패: datetime 형식이 잘못됨 ({dt_str!r})."
+    start_ts = start.timestamp()
+    # 과거 시각 거부 — LLM 이 '내일' 을 어제로 잘못 환산하는 케이스 방어.
+    # 60초 grace 는 LLM 응답 지연 사이 약간의 시차 허용.
+    if start_ts < time.time() - 60:
+        return (
+            f"실패: 과거 시각으로는 일정 등록 X "
+            f"({start.strftime('%Y-%m-%d %H:%M')}). "
+            f"[지금:] 표시를 다시 확인하고 미래 시각으로 재시도."
+        )
     end_ts: Optional[float] = None
     end_str = str(args.get("end_datetime", "")).strip()
     if end_str:
         try:
-            end_ts = datetime.datetime.fromisoformat(end_str).timestamp()
+            end_dt = datetime.datetime.fromisoformat(end_str)
+            if end_dt.timestamp() > start_ts:  # end 가 start 보다 뒤일 때만
+                end_ts = end_dt.timestamp()
         except ValueError:
             end_ts = None
     try:
@@ -483,7 +494,7 @@ def _add_event(store, args: dict) -> str:
         lead = 15
     lead = max(0, min(lead, 24 * 60))  # 최대 24시간
     ev = store.add_event(
-        summary, start.timestamp(), end_ts=end_ts, reminder_lead_min=lead
+        summary, start_ts, end_ts=end_ts, reminder_lead_min=lead
     )
     if ev is None:
         return "실패: 일정 등록 중 오류."

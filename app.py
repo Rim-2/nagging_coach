@@ -69,6 +69,7 @@ PROACTIVE_CHECK_INTERVAL = 120.0  # 프로액티브 조건 점검 주기
 AI_FAILURE_WARN_THRESHOLD = 3     # 연속 N회 실패 시 사용자에게 시스템 경고
 REMINDER_LEAD_MIN = 15.0          # 캘린더 일정 N분 전에 리마인드
 REMINDER_CHECK_INTERVAL = 120.0   # 일정 리마인더 점검 주기
+REMINDER_GRACE_SEC = 600.0        # 폴링 miss·재시작으로 늦은 알림 — N초 안이면 발사 (10분)
 ALARM_CHECK_INTERVAL = 30.0       # 예약 알람 점검 주기
 WEEKLY_REVIEW_HOUR = 21           # 매주 일요일 N시에 주간 회고 ritual
 WEEKLY_REVIEW_CHECK_INTERVAL = 300.0  # 5분 주기로 시각 체크 (21:00~21:59 사이 1회)
@@ -677,12 +678,16 @@ class CoachApp:
                         continue
                     minutes = (start - now_utc).total_seconds() / 60.0
                     if 0 < minutes <= REMINDER_LEAD_MIN:
-                        reminded_google.add(eid)
-                        self._send_event_reminder(
+                        sent = self._send_event_reminder(
                             chat_id, ev.get("summary", "일정"), int(minutes)
                         )
+                        if sent:  # 발송 성공 시에만 마크 — 실패 시 다음 폴링 재시도
+                            reminded_google.add(eid)
 
             # --- 봇 자체 일정 (Google 인증 무관) ---
+            # 발사 윈도우: [start_ts - lead_sec, start_ts + GRACE].
+            # 폴링 간격(2분)보다 짧은 lead_min 또는 컨테이너 재시작으로 인한
+            # 폴링 miss 를 보완하기 위해 시작 시각 후 일정 시간까지 grace.
             now_ts = time.time()
             for ev in self._store.events:
                 if ev.get("reminded"):
@@ -691,11 +696,15 @@ class CoachApp:
                 if start_ts is None:
                     continue
                 lead_sec = (ev.get("reminder_lead_min", 15) or 15) * 60
-                if start_ts - lead_sec <= now_ts < start_ts:
-                    minutes_left = max(0, int((start_ts - now_ts) / 60))
-                    self._send_event_reminder(
-                        chat_id, ev.get("summary", "일정"), minutes_left
-                    )
+                window_start = start_ts - lead_sec
+                window_end = start_ts + REMINDER_GRACE_SEC
+                if now_ts < window_start or now_ts > window_end:
+                    continue
+                minutes_left = max(0, int((start_ts - now_ts) / 60))
+                sent = self._send_event_reminder(
+                    chat_id, ev.get("summary", "일정"), minutes_left
+                )
+                if sent:  # 발송 성공 시에만 영구 마크 — 실패 시 다음 폴링 재시도
                     self._store.mark_event_reminded(ev["id"])
 
             # 지난 일정은 자동 정리 (메모리·저장 비대 방지)
@@ -703,14 +712,16 @@ class CoachApp:
 
     def _send_event_reminder(
         self, chat_id: int, summary: str, minutes: int
-    ) -> None:
+    ) -> bool:
+        """일정 미리 알림 발송. 발송 성공 여부를 반환한다 — 호출자는 이걸
+        보고 reminded 마크 여부를 결정 (실패 시 마크 X → 다음 폴링 재시도)."""
         try:
             msg = self._agent.event_reminder(summary, minutes)
         except AIGenerationError as exc:
             print(f"[App] 리마인더 생성 실패 — 기본 문구 사용: {exc}")
             msg = f"곧 '{summary}' 시작이야 — {minutes}분 남았어!"
         print(f"[App] 일정 리마인더 발송: {summary} ({minutes}분 전)")
-        self._send(chat_id, msg)
+        return self._send(chat_id, msg)
 
     @staticmethod
     def _parse_event_start(value: Optional[str]):
