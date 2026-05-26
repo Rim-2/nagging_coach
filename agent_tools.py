@@ -204,8 +204,8 @@ def build_tools(
             description=(
                 "WOOP/MCII 의 Plan 단계 — 사용자가 '만약 X 상황이 오면 그땐 Y "
                 "한다' 식 if-then 문장으로 자기 약점·습관 대응을 정리했을 때 "
-                "저장한다. Implementation intention 은 임상 연구에서 미루기·"
-                "습관 형성 효과 검증된 기법 (메타분석 g=0.34, 24 trials). "
+                "저장한다. Implementation intention 은 의지력에 기대지 않고 "
+                "미리 정해둔 자동 반응으로 약점을 우회하는 검증된 방식이다. "
                 "저장된 plan 들은 [상태 메모]에 노출되어 다음 대화·잔소리에서 "
                 "코치가 참고한다. WOOP 4단계 모두 끌어낸 뒤 Plan 이 충분히 "
                 "구체적일 때만 호출 — 모호한 다짐 X."
