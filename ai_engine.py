@@ -277,7 +277,9 @@ class CoachAgent:
         self._model_name = model_name
         self._calendar = calendar
         self._tools = build_tools(
-            calendar, store, on_goal_set=self._on_goal_set
+            calendar, store,
+            on_goal_set=self._on_goal_set,
+            analyze_patterns=self._build_pattern_analysis,
         )  # {name: Tool}
         self._chat = self._new_chat()
 
@@ -517,7 +519,8 @@ class CoachAgent:
     def weekly_review(self) -> str:
         """매주 회고 ritual. 지난 7일 누적 데이터를 함께 끼워서 회고 대화를
         시작한다 — 잘된 것 하나·막힌 것 하나·다음 주 작은 한 가지를 친구처럼
-        끌어내는 톤."""
+        끌어내는 톤. 자주 잡혔지만 아직 weak_spots 에 없는 앱이 있으면
+        '약점으로 등록할까?' 자연스럽게 한 번 확인."""
         with self._lock:
             summary = self._store.weekly_summary(days=7)
             rec = summary["recent"]
@@ -530,9 +533,22 @@ class CoachAgent:
                 f"{rec['trigger_total']}회 (지난주 {prev['trigger_total']}), "
                 f"가장 자주 잡힌 패턴 '{top}'"
             )
+            # 자기학습 weak_spot 후보 — 자주 잡혔지만 아직 등록 안 된 앱들
+            candidates = self._store.top_weak_spot_candidates(n=3)
+            cand_line = ""
+            if candidates:
+                cand_str = ", ".join(
+                    f"'{label}'(x{cnt})" for label, cnt in candidates
+                )
+                cand_line = (
+                    f" 또 이번 주 자주 잡혔는데 약점 목록엔 아직 없는 앱: "
+                    f"{cand_str}. 회고 끝물에 '이것도 약점으로 등록해둘까?' "
+                    f"한 번 자연스럽게 물어봐 — 사용자가 '응' 하면 그게 EXTRACT 의 "
+                    f"weak_spots 로 자동 잡힌다. 무리하게 들이밀진 마라."
+                )
             prompt = (
                 "[자동 트리거] 주간 회고 시각이야 (일요일 저녁). 지난 7일 "
-                f"활동 데이터: {data_line}.\n"
+                f"활동 데이터: {data_line}.{cand_line}\n"
                 "사용자한테 회고 대화를 시작해 — 데이터를 인사처럼 가볍게 "
                 "꺼내고 (수치는 자랑 말고 사실만), '잘됐던 거 하나, 막혔던 "
                 "거 하나, 다음 주에 시도해볼 작은 거 하나' 식으로 한 단계씩 "
@@ -807,6 +823,103 @@ class CoachAgent:
                 if result.get("leveled_up"):
                     note += f", 레벨업 → {result.get('level')}"
                 print(f"[CoachAgent] 습관 수행: {habit_done} ({note})")
+
+    # ============================================= 패턴 분석 (analyze_my_patterns)
+    def _build_pattern_analysis(self, days: int) -> str:
+        """최근 N일 daily_stats 를 자연어로 풀어 LLM 에 던지고, 의미 있는 패턴
+        3~5개를 자연어로 받아온다. agent_tools 의 analyze_my_patterns 도구가
+        이 메서드를 콜백으로 호출."""
+        days = max(1, min(int(days or 30), 90))
+        stats = self._store.daily_stats
+        if not stats:
+            return "최근 데이터가 아직 없다 — 며칠 더 써보고 분석해줘."
+
+        # 최근 N일 raw 로그를 한 줄씩
+        sorted_dates = sorted(stats.keys())[-days:]
+        raw_lines: List[str] = []
+        for d in sorted_dates:
+            b = stats[d]
+            triggers = b.get("triggers") or {}
+            moods = b.get("mood_logs") or []
+            if (
+                not triggers
+                and not moods
+                and (b.get("goals_completed") or 0) == 0
+                and (b.get("habit_dones") or 0) == 0
+            ):
+                continue
+            parts = [d]
+            if triggers:
+                parts.append(
+                    "트리거(" + ", ".join(f"{k}×{v}" for k, v in triggers.items()) + ")"
+                )
+            parts.append(
+                f"목표 완료={b.get('goals_completed', 0)}/"
+                f"{b.get('goals_registered', 0)}"
+            )
+            parts.append(f"습관={b.get('habit_dones', 0)}")
+            if moods:
+                ratings = [int(m.get("rating", 0) or 0) for m in moods]
+                avg = sum(ratings) / max(1, len(ratings))
+                parts.append(f"mood={avg:.1f}/5({len(moods)}회)")
+                notes = [
+                    str(m.get("note", "")).strip()
+                    for m in moods
+                    if str(m.get("note", "")).strip()
+                ]
+                if notes:
+                    parts.append("메모: " + " / ".join(notes[:2]))
+            raw_lines.append("  " + " | ".join(parts))
+
+        if not raw_lines:
+            return f"최근 {days}일 활동 데이터가 거의 없어 — 분석할 거리가 부족."
+
+        weekly = self._store.weekly_summary(days=min(days, 14))
+        rec = weekly["recent"]
+        profile = self._store.profile
+        weak = self._store.weak_spots
+
+        ctx = (
+            f"사용자 활동 로그 최근 {len(sorted_dates)}일:\n"
+            + "\n".join(raw_lines)
+            + f"\n\n누적 요약 (최근 {weekly['window_days']}일): "
+            + f"목표 완료 {rec['goals_completed']}회 (등록 "
+            + f"{rec.get('goals_registered', 0)}), "
+            + f"습관 {rec['habit_dones']}회, "
+            + f"잔소리 트리거 {rec['trigger_total']}회"
+        )
+        if rec.get("mood_avg") is not None:
+            ctx += f", mood 평균 {rec['mood_avg']:.1f}/5 ({rec.get('mood_count', 0)}회)"
+        if profile:
+            ctx += f"\n프로필: {profile}"
+        if weak:
+            ctx += f"\n등록된 약점: {', '.join(weak)}"
+
+        prompt = (
+            ctx + "\n\n"
+            "위 데이터를 보고 의미 있는 패턴 3~5개를 뽑아라. 예시 방향:\n"
+            "- 시간대·요일별 생산성/무너짐 패턴\n"
+            "- 자주 잡히는 트리거 종류와 그 직전 활동\n"
+            "- mood 가 ↑ / ↓ 되는 활동의 상관관계\n"
+            "- 등록된 약점 외에 새로 의심되는 행동\n"
+            "각 패턴은 데이터로 뒷받침 가능해야 한다 — 추측 금지. "
+            "친구한테 이야기 들려주듯 한국어 반말, 핵심만. "
+            "맨 앞에 '최근 N일 패턴' 같은 라벨 X — 바로 본문 시작."
+        )
+        try:
+            return self._generate_once(
+                prompt,
+                system_instruction=(
+                    "너는 사용자 활동 로그에서 의미 있는 패턴을 추출하는 분석가. "
+                    "데이터로 뒷받침되지 않는 추측·과장 금지. 한국어 반말, "
+                    "친근하지만 사실 기반."
+                ),
+                temperature=0.3,
+                max_output_tokens=600,
+                label="pattern-analyze",
+            )
+        except AIGenerationError as exc:
+            return f"패턴 분석 중 오류 — {exc}"
 
     # ================================================= 딴짓 판독 (무상태)
     def judge_distracted(

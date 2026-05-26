@@ -102,6 +102,7 @@ class Store:
             "last_weekly_review": None,
             "last_overload_checkin": None,
             "implementation_intentions": [],
+            "weak_spot_candidates": {},
         }
         self._load()
 
@@ -321,6 +322,42 @@ class Store:
                     seen.add(item.lower())
             self._persist()
 
+    # ------------------------------------------- 약점 후보 (자기학습)
+    def bump_weak_spot_candidate(self, app_label: str) -> None:
+        """트리거가 잡힌 앱/사이트 라벨을 후보 카운터에 +1. 주간 회고 때
+        가장 자주 잡힌 후보를 사용자한테 '추가할까?' 확인 받는 데 쓴다."""
+        label = (app_label or "").strip()
+        if not label:
+            return
+        with self._lock:
+            cands = self._data.setdefault("weak_spot_candidates", {})
+            cands[label] = cands.get(label, 0) + 1
+            # 비대 방지 — 100개 넘으면 빈도 낮은 절반 정리
+            if len(cands) > 100:
+                ranked = sorted(cands.items(), key=lambda kv: kv[1])
+                for k, _ in ranked[:50]:
+                    cands.pop(k, None)
+            self._persist()
+
+    def top_weak_spot_candidates(self, n: int = 5) -> List[tuple]:
+        """가장 자주 잡힌 후보 N개 — 이미 weak_spots 에 있는 건 제외.
+        반환: [(label, count), ...] 내림차순."""
+        with self._lock:
+            existing = {s.lower() for s in self._data["weak_spots"]}
+            items = [
+                (k, v)
+                for k, v in self._data.get("weak_spot_candidates", {}).items()
+                if k.lower() not in existing
+            ]
+            items.sort(key=lambda kv: -kv[1])
+            return items[:n]
+
+    def reset_weak_spot_candidates(self) -> None:
+        """후보 카운터 초기화 — 주간 회고 발송 성공 시 호출 (새 주 시작)."""
+        with self._lock:
+            self._data["weak_spot_candidates"] = {}
+            self._persist()
+
     # --------------------------------------------------------- 일별 통계
     DAILY_STATS_MAX_DAYS = 60     # 너무 오래된 날짜는 자동 정리 (메모리·저장 비대 방지)
 
@@ -402,6 +439,79 @@ class Store:
             "window_days": days,
             "recent": _aggregate_buckets(recent_buckets),
             "previous": _aggregate_buckets(previous_buckets),
+        }
+
+    def mood_correlation(self, days: int = 14) -> dict:
+        """일별 mood 평균을 activity 그룹별로 비교 — '목표 완료한 날 / 안 한 날'
+        등으로 mood 가 어떻게 다른지 결정론적으로 계산.
+        충분한 mood 기록이 있는 날 4일 미만이면 insufficient_data=True.
+        반환 dict 의 각 비교 결과는 mood 평균 차이가 0.5 미만이면 None — 노이즈로 본다."""
+        today = datetime.date.today()
+        target_dates = [
+            (today - datetime.timedelta(days=i)).isoformat()
+            for i in range(days)
+        ]
+        with self._lock:
+            stats_data = self._data["daily_stats"]
+            day_data: List[Dict[str, Any]] = []
+            for d in target_dates:
+                b = stats_data.get(d)
+                if not b:
+                    continue
+                moods = b.get("mood_logs") or []
+                if not moods:
+                    continue
+                ratings = [int(m.get("rating", 0) or 0) for m in moods]
+                if not ratings:
+                    continue
+                day_data.append({
+                    "date": d,
+                    "mood_avg": sum(ratings) / len(ratings),
+                    "goals_completed": int(b.get("goals_completed", 0) or 0),
+                    "habit_dones": int(b.get("habit_dones", 0) or 0),
+                    "trigger_total": sum(
+                        int(v or 0) for v in (b.get("triggers") or {}).values()
+                    ),
+                })
+
+        if len(day_data) < 4:
+            return {"insufficient_data": True, "log_days": len(day_data)}
+
+        def _avg(arr: list, key: str = "mood_avg") -> Optional[float]:
+            if not arr:
+                return None
+            return sum(d[key] for d in arr) / len(arr)
+
+        def _compare(with_arr: list, without_arr: list) -> Optional[dict]:
+            with_avg = _avg(with_arr)
+            without_avg = _avg(without_arr)
+            if with_avg is None or without_avg is None:
+                return None
+            diff = with_avg - without_avg
+            if abs(diff) < 0.5:
+                return None  # 노이즈
+            return {
+                "with": round(with_avg, 2),
+                "without": round(without_avg, 2),
+                "diff": round(diff, 2),
+                "n_with": len(with_arr),
+                "n_without": len(without_arr),
+            }
+
+        return {
+            "log_days": len(day_data),
+            "goal_completion": _compare(
+                [d for d in day_data if d["goals_completed"] >= 1],
+                [d for d in day_data if d["goals_completed"] == 0],
+            ),
+            "habit": _compare(
+                [d for d in day_data if d["habit_dones"] >= 1],
+                [d for d in day_data if d["habit_dones"] == 0],
+            ),
+            "low_trigger": _compare(
+                [d for d in day_data if d["trigger_total"] <= 1],
+                [d for d in day_data if d["trigger_total"] >= 3],
+            ),
         }
 
     # --------------------------------------------------- WOOP if-then plan

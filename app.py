@@ -513,6 +513,11 @@ class CoachApp:
         self._arm_warning_timeout()
         if sent_ok:
             self._store.bump_trigger_fire(trigger.value)
+            # 자기학습 weak_spot 후보 — sanitized 라벨 (PC 환경)
+            from tracker import sanitize_window_title
+            label = sanitize_window_title(snap.active_window)
+            if label and label != "other":
+                self._store.bump_weak_spot_candidate(label)
             if not self._store.nag_policy_asked:
                 self._store.nag_policy_asked = True
 
@@ -671,6 +676,10 @@ class CoachApp:
             )
         if sent_ok:
             self._store.bump_trigger_fire(trigger_value)
+            # 자기학습 weak_spot 후보 — 폰 위성이 보낸 active_window (앱 패키지명)
+            app_label = snap.get("active_window") or ""
+            if app_label:
+                self._store.bump_weak_spot_candidate(app_label)
             if not self._store.nag_policy_asked:
                 self._store.nag_policy_asked = True
         return {"ok": True, "action": "nag_sent"}
@@ -965,6 +974,8 @@ class CoachApp:
             print("[App] 주간 회고 발송")
             if self._send(chat_id, reply):
                 self._store.last_weekly_review = today_s
+                # 자기학습 weak_spot 후보 카운터 reset — 새 주 시작
+                self._store.reset_weak_spot_candidates()
 
     # ====================================================== 매일 재시작
     def _daily_restart_loop(self) -> None:

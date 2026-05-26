@@ -28,12 +28,17 @@ class Tool:
 
 
 def build_tools(
-    calendar, store, on_goal_set: Optional[Callable[[str], None]] = None
+    calendar,
+    store,
+    on_goal_set: Optional[Callable[[str], None]] = None,
+    analyze_patterns: Optional[Callable[[int], str]] = None,
 ) -> Dict[str, Tool]:
     """현재 사용 가능한 도구 목록을 만든다.
     calendar 가 None 이면 캘린더 도구는 빠진다 (그 능력만 비활성).
     on_goal_set 은 register_today_goal_with_steps 가 새 과제를 저장한 직후
-    PC 감시 wake-up 등 후처리를 트리거하기 위한 콜백."""
+    PC 감시 wake-up 등 후처리를 트리거하기 위한 콜백.
+    analyze_patterns 는 LLM focused 호출로 패턴 분석을 수행하는 콜백 (없으면
+    analyze_my_patterns 도구가 비활성)."""
     tools: Dict[str, Tool] = {}
     notify_goal_set = on_goal_set or (lambda _g: None)
 
@@ -439,6 +444,34 @@ def build_tools(
         run=lambda args: _log_mood(store, args),
     )
 
+    # ---- 패턴 분석: 사용자 활동 로그를 LLM 으로 분석 ----
+    if analyze_patterns is not None:
+        tools["analyze_my_patterns"] = Tool(
+            types.FunctionDeclaration(
+                name="analyze_my_patterns",
+                description=(
+                    "사용자의 최근 활동·기분·트리거 로그 (N일치) 를 AI 가 "
+                    "분석해 의미 있는 패턴 3~5개를 자연어로 뽑아낸다. 예: "
+                    "시간대별 생산성, 자주 무너지는 패턴, mood 가 ↑/↓ 되는 "
+                    "활동 등. 사용자가 '내 패턴 분석해줘', '요즘 내 모습 "
+                    "어때' 같이 물을 때 호출. 매번 부르진 말고 정말 필요할 때만."
+                ),
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "days": types.Schema(
+                            type="INTEGER",
+                            description=(
+                                "(선택) 분석할 일수, 기본 30. 7~90 권장. "
+                                "데이터 적으면 자동으로 작은 윈도우로 잘림."
+                            ),
+                        ),
+                    },
+                ),
+            ),
+            run=lambda args: _analyze_my_patterns(analyze_patterns, args),
+        )
+
     # ---- 주간 인사이트: 격려·칭찬에 구체적 근거 제공 ----
     tools["get_weekly_insight"] = Tool(
         types.FunctionDeclaration(
@@ -796,6 +829,20 @@ def _log_mood(store, args: dict) -> str:
     return f"성공: mood {rating}/5 기록" + (f" (메모: {note[:60]})" if note else "") + "."
 
 
+# ---------------------------------------------------------- 패턴 분석
+def _analyze_my_patterns(analyze_fn, args: dict) -> str:
+    try:
+        days = int(args.get("days", 30) or 30)
+    except Exception:
+        days = 30
+    days = max(1, min(days, 90))
+    try:
+        result = analyze_fn(days)
+    except Exception as exc:
+        return f"실패: 패턴 분석 중 오류 — {exc}"
+    return result if result else "분석 결과가 비어있다 — 데이터 부족일 수 있어."
+
+
 # ---------------------------------------------------------- 주간 인사이트
 def _get_weekly_insight(store) -> str:
     """지난 7일 vs 그 전 7일 누적 비교를 한 줄 자연어로. 코치가 칭찬·격려에
@@ -845,6 +892,35 @@ def _get_weekly_insight(store) -> str:
         if notes:
             mood_line += " 최근 메모: " + "; ".join(f'"{n}"' for n in notes) + "."
 
+    # mood ↔ 활동 인과 (최근 14일, 충분한 데이터 있을 때만)
+    corr_line = ""
+    corr = store.mood_correlation(days=14)
+    if not corr.get("insufficient_data"):
+        bits = []
+        g = corr.get("goal_completion")
+        if g:
+            arrow = "↑" if g["diff"] > 0 else "↓"
+            bits.append(
+                f"목표 완료한 날 mood {arrow}{abs(g['diff'])} "
+                f"({g['with']} vs {g['without']})"
+            )
+        h = corr.get("habit")
+        if h:
+            arrow = "↑" if h["diff"] > 0 else "↓"
+            bits.append(
+                f"습관 한 날 mood {arrow}{abs(h['diff'])} "
+                f"({h['with']} vs {h['without']})"
+            )
+        t = corr.get("low_trigger")
+        if t:
+            arrow = "↑" if t["diff"] > 0 else "↓"
+            bits.append(
+                f"트리거 적은 날 mood {arrow}{abs(t['diff'])} "
+                f"({t['with']} vs {t['without']})"
+            )
+        if bits:
+            corr_line = " 활동-기분 상관: " + " · ".join(bits) + "."
+
     return (
         f"최근 7일 — {rate_line}; "
         f"목표 완료 {rec['goals_completed']}회 "
@@ -855,6 +931,7 @@ def _get_weekly_insight(store) -> str:
         f"({_delta(rec['trigger_total'], prev['trigger_total'])}, 적을수록 좋음). "
         f"가장 자주 잡힌 패턴: '{rec['top_trigger'] or '-'}'."
         f"{mood_line}"
+        f"{corr_line}"
     )
 
 
