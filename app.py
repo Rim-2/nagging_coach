@@ -68,6 +68,15 @@ REMINDER_LEAD_MIN = 15.0          # 캘린더 일정 N분 전에 리마인드
 REMINDER_CHECK_INTERVAL = 120.0   # 일정 리마인더 점검 주기
 ALARM_CHECK_INTERVAL = 30.0       # 예약 알람 점검 주기
 
+# ── 자동 복구 (Railway가 컨테이너를 자동 재시작하는 걸 이용) ─────────────
+# A) 텔레그램 발송이 연속 N회 실패하면 컨테이너 자살 → Railway가 재시작.
+#    네트워크 누적 문제로 send가 막힐 때 사람 개입 없이 복구하기 위함.
+TG_FAILURE_EXIT_THRESHOLD = 20
+# C) 매일 새벽 한 번 깨끗한 상태로 재시작 (장기 누적 문제 예방).
+DAILY_RESTART_HOUR = 4
+DAILY_RESTART_MIN_UPTIME_HOURS = 23
+DAILY_RESTART_CHECK_INTERVAL = 300.0  # 5분 주기로 시각 체크
+
 
 class CoachApp:
     def __init__(self) -> None:
@@ -96,6 +105,8 @@ class CoachApp:
         self._last_user_msg = time.time()    # 사용자가 마지막으로 보낸 시각
         self._last_proactive = time.time()   # 봇이 마지막으로 먼저 말 건 시각
         self._consecutive_ai_failures = 0
+        self._consecutive_tg_failures = 0    # 텔레그램 발송 연속 실패 카운터 (자동 재시작용)
+        self._started_at = time.time()       # 컨테이너 시작 시각 (매일 재시작 판단용)
         self._ignored_nags = 0               # 연속으로 무시당한 잔소리 횟수
 
     @staticmethod
@@ -151,6 +162,9 @@ class CoachApp:
         threading.Thread(
             target=self._alarm_loop, name="Alarm", daemon=True
         ).start()
+        threading.Thread(
+            target=self._daily_restart_loop, name="DailyRestart", daemon=True
+        ).start()
 
         print("[App] 실행 중. Ctrl+C 로 종료.")
         try:
@@ -187,7 +201,7 @@ class CoachApp:
 
         registered = self._store.chat_id
         if registered is None:
-            self._tg.send_message(
+            self._send(
                 chat_id, "먼저 /start 를 보내줘. 그래야 너랑 짝이 될 수 있어."
             )
             return
@@ -196,7 +210,7 @@ class CoachApp:
 
         if text.startswith("/reset"):
             self._agent.reset()
-            self._tg.send_message(
+            self._send(
                 chat_id, "기억 싹 비웠어. 자, 다시 시작하자 — 오늘 뭐 할 거야?"
             )
             return
@@ -215,7 +229,7 @@ class CoachApp:
             if self._tracker is not None
             else ""
         )
-        self._tg.send_message(
+        self._send(
             chat_id,
             "안녕! 난 너의 잔소리 코치야 😎\n"
             "앞으로 여기서 같이 떠들면서 오늘 할 일 챙겨줄게. "
@@ -231,7 +245,7 @@ class CoachApp:
             self._note_ai_failure(chat_id, exc)
             return
         self._consecutive_ai_failures = 0
-        self._tg.send_message(chat_id, reply)
+        self._send(chat_id, reply)
 
     def _handle_photo(self, chat_id: int, photo: list, caption: str) -> None:
         """완료 증거 사진을 받아 AI 비전 판독으로 처리한다."""
@@ -241,7 +255,7 @@ class CoachApp:
             image = self._tg.download_file(file_id)
         except Exception as exc:
             print(f"[App] 사진 다운로드 실패: {exc}")
-            self._tg.send_message(chat_id, "사진을 못 받았어 — 다시 보내줄래?")
+            self._send(chat_id, "사진을 못 받았어 — 다시 보내줄래?")
             return
         try:
             reply = self._agent.verify_completion(image, caption)
@@ -249,7 +263,7 @@ class CoachApp:
             self._note_ai_failure(chat_id, exc)
             return
         self._consecutive_ai_failures = 0
-        self._tg.send_message(chat_id, reply)
+        self._send(chat_id, reply)
 
     # ==================================================== Tracker 콜백
     def _on_trigger(self, trigger: TriggerType, snap: Snapshot) -> None:
@@ -291,7 +305,7 @@ class CoachApp:
 
         self._consecutive_ai_failures = 0
         print(f"[App] 트리거 [{trigger.value}] → 잔소리 발송")
-        self._tg.send_message(chat_id, reply)
+        self._send(chat_id, reply)
         self._arm_warning_timeout()
 
     @staticmethod
@@ -423,7 +437,7 @@ class CoachApp:
                 print(f"[App] 프로액티브 생성 실패: {exc}")
                 continue
             print("[App] 프로액티브 메시지 발송")
-            self._tg.send_message(chat_id, reply)
+            self._send(chat_id, reply)
 
     # ====================================================== 일정 리마인더
     def _reminder_loop(self) -> None:
@@ -460,7 +474,7 @@ class CoachApp:
             print(f"[App] 리마인더 생성 실패 — 기본 문구 사용: {exc}")
             msg = f"곧 '{summary}' 시작이야 — {minutes}분 남았어!"
         print(f"[App] 일정 리마인더 발송: {summary} ({minutes}분 전)")
-        self._tg.send_message(chat_id, msg)
+        self._send(chat_id, msg)
 
     @staticmethod
     def _parse_event_start(value: Optional[str]):
@@ -507,7 +521,24 @@ class CoachApp:
             print(f"[App] 알람 메시지 생성 실패 — 기본 문구 사용: {exc}")
             msg = f"⏰ 알람: {text}"
         print(f"[App] 알람 발송: {text}")
-        self._tg.send_message(chat_id, msg)
+        self._send(chat_id, msg)
+
+    # ====================================================== 매일 재시작
+    def _daily_restart_loop(self) -> None:
+        """매일 새벽 한 번 컨테이너를 자살시켜 Railway가 다시 띄우게 한다.
+        장기 실행 시 누적되는 알 수 없는 문제(네트워크 세션, FD, 메모리 등)를
+        깨끗이 리셋하는 안전망. 사용자가 자고 있을 새벽 시간에만 동작."""
+        while not self._stop.wait(DAILY_RESTART_CHECK_INTERVAL):
+            uptime_hours = (time.time() - self._started_at) / 3600.0
+            if uptime_hours < DAILY_RESTART_MIN_UPTIME_HOURS:
+                continue
+            if datetime.datetime.now().hour == DAILY_RESTART_HOUR:
+                print(
+                    f"[App] 매일 재시작 시각({DAILY_RESTART_HOUR}시) 도달 "
+                    f"(uptime {uptime_hours:.1f}h) — 컨테이너 재시작 유도 (exit 1)",
+                    flush=True,
+                )
+                os._exit(1)
 
     # ========================================================= helpers
     def _start_tracking(self) -> None:
@@ -522,12 +553,29 @@ class CoachApp:
         self._consecutive_ai_failures += 1
         print(f"[App] AI 실패 #{self._consecutive_ai_failures}: {exc}")
         if self._consecutive_ai_failures >= AI_FAILURE_WARN_THRESHOLD:
-            self._tg.send_message(
+            self._send(
                 chat_id,
                 "(시스템) AI 응답이 계속 실패하고 있어. "
                 "GEMINI_API_KEY·쿼터·네트워크를 확인해줘.",
             )
             self._consecutive_ai_failures = 0
+
+    def _send(self, chat_id: int, text: str) -> bool:
+        """텔레그램 발송 wrapper. 연속 실패가 임계치를 넘으면 컨테이너 자살 →
+        Railway가 자동 재시작 (사람 개입 없이 누적 네트워크 문제 복구)."""
+        ok = self._tg.send_message(chat_id, text)
+        if ok:
+            self._consecutive_tg_failures = 0
+            return True
+        self._consecutive_tg_failures += 1
+        if self._consecutive_tg_failures >= TG_FAILURE_EXIT_THRESHOLD:
+            print(
+                f"[App] 텔레그램 발송 {self._consecutive_tg_failures}회 연속 실패 "
+                f"— 컨테이너 재시작 유도 (exit 1)",
+                flush=True,
+            )
+            os._exit(1)
+        return False
 
 
 def main() -> None:
