@@ -21,6 +21,8 @@ app.py — 잔소리 코치 (헤드리스 텔레그램 봇) 메인 진입점
 from __future__ import annotations
 
 import datetime
+import http.server
+import json
 import os
 import sys
 import threading
@@ -76,6 +78,64 @@ TG_FAILURE_EXIT_THRESHOLD = 20
 DAILY_RESTART_HOUR = 4
 DAILY_RESTART_MIN_UPTIME_HOURS = 23
 DAILY_RESTART_CHECK_INTERVAL = 300.0  # 5분 주기로 시각 체크
+
+
+class _TriggerHTTPHandler(http.server.BaseHTTPRequestHandler):
+    """원격 PC 트래커 위성(trigger_satellite.py)에서 보내는 트리거를 받는
+    미니 HTTP 핸들러. Bearer 토큰으로 인증하고, 검증된 요청만 CoachApp.
+    handle_remote_trigger 로 위임한다.
+
+    같은 봇 토큰으로 두 인스턴스가 텔레그램 폴링을 동시에 하면 409 충돌이
+    나기 때문에, '클라우드 24/7 봇 + 로컬 PC 감시'를 같이 운영하려면 로컬은
+    텔레그램에 손대지 않고 트리거만 여기로 쏴야 한다."""
+
+    # 서브클래스 팩토리(_start_http_server)에서 주입된다.
+    coach_app: Optional["CoachApp"] = None
+    trigger_secret: str = ""
+
+    def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler 인터페이스
+        if self.path != "/trigger":
+            self._respond(404, {"ok": False, "error": "not found"})
+            return
+        if not self.trigger_secret:
+            self._respond(503, {"ok": False, "error": "secret not configured"})
+            return
+        if self.headers.get("Authorization", "") != f"Bearer {self.trigger_secret}":
+            self._respond(401, {"ok": False, "error": "unauthorized"})
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            body = json.loads(raw.decode("utf-8") or "{}")
+        except Exception as exc:
+            self._respond(400, {"ok": False, "error": f"bad json: {exc}"})
+            return
+        try:
+            result = self.coach_app.handle_remote_trigger(body)
+        except Exception as exc:
+            print(f"[App] 원격 트리거 처리 오류: {exc}")
+            self._respond(500, {"ok": False, "error": "internal"})
+            return
+        self._respond(200, result)
+
+    def do_GET(self) -> None:  # noqa: N802
+        # 외부에서 curl 로 살아있는지 찔러볼 수 있는 헬스체크용 엔드포인트.
+        if self.path in ("/", "/health"):
+            self._respond(200, {"ok": True, "service": "nagging_coach"})
+            return
+        self._respond(404, {"ok": False, "error": "not found"})
+
+    def log_message(self, format, *args) -> None:  # noqa: A002
+        # 기본 access log 는 stderr 로 시끄러움 — 우리 print 만 남긴다.
+        return
+
+    def _respond(self, code: int, payload: dict) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 class CoachApp:
@@ -165,6 +225,7 @@ class CoachApp:
         threading.Thread(
             target=self._daily_restart_loop, name="DailyRestart", daemon=True
         ).start()
+        self._start_http_server()
 
         print("[App] 실행 중. Ctrl+C 로 종료.")
         try:
@@ -290,7 +351,12 @@ class CoachApp:
                 return
             print(f"[App] 산만함 판독: 딴짓 확정 ({freq})")
 
-        description = self._describe_trigger(trigger, snap, goal)
+        snap_dict = {
+            "active_window": snap.active_window,
+            "idle_time": snap.idle_time,
+            "switch_count": snap.switch_count,
+        }
+        description = self._describe_trigger(trigger.value, snap_dict, goal)
         if self._ignored_nags >= 1:
             description += (
                 f" (사용자가 잔소리를 이미 {self._ignored_nags}번 무시하고 "
@@ -310,19 +376,23 @@ class CoachApp:
 
     @staticmethod
     def _describe_trigger(
-        trigger: TriggerType, snap: Snapshot, goal: Optional[str]
+        trigger_value: str, snap: dict, goal: Optional[str]
     ) -> str:
-        win = snap.active_window or "(알 수 없는 창)"
-        idle_min = int(snap.idle_time // 60)
+        """트리거를 사람·LLM 이 읽을 자연어 설명으로 변환. 로컬 Tracker 콜백과
+        원격 위성(/trigger HTTP) 둘 다 같은 함수로 통일. enum 대신 한글 value
+        문자열을 받으므로 Tracker 의존성이 없는 Railway 컨테이너에서도 동작."""
+        win = snap.get("active_window") or "(알 수 없는 창)"
+        idle_min = int((snap.get("idle_time") or 0) // 60)
+        switch_count = snap.get("switch_count") or 0
 
         # 수면·휴식 잔소리는 목표와 무관 — 본문만 돌려준다.
-        if trigger == TriggerType.LATE_NIGHT:
+        if trigger_value == "늦은 밤":
             hour = datetime.datetime.now().hour
             return (
                 f"지금 새벽 {hour}시인데 사용자가 아직 PC 앞에서 안 자고 있어. "
                 f"수면 챙기라고 한마디 해줘."
             )
-        if trigger == TriggerType.OVERWORK:
+        if trigger_value == "휴식 없는 과로":
             return (
                 "사용자가 2시간 넘게 쉬는 틈도 없이 계속 화면 앞에 붙어 있어. "
                 "눈도 몸도 지칠 텐데 — 잠깐 쉬라고 챙겨줘."
@@ -333,37 +403,87 @@ class CoachApp:
             if goal
             else " 심지어 오늘 목표도 아직 안 정했어."
         )
-        if trigger == TriggerType.DOPAMINE_ZOMBIE:
+        if trigger_value == "도파민 좀비":
             body = (
                 f"사용자가 '{win}' 화면을 {idle_min}분째 입력도 없이 "
                 f"멍하니 보고 있어 (도파민 좀비)."
             )
-        elif trigger == TriggerType.ACTIVE_SCROLL:
+        elif trigger_value == "능동적 도파민 스크롤":
             body = (
                 f"사용자가 '{win}'을 15분 넘게 손 안 떼고 계속 스크롤하며 "
                 f"도파민 서핑 중이야 (능동적 딴짓)."
             )
-        elif trigger == TriggerType.DISTRACTED_SWITCHING:
+        elif trigger_value == "산만함/널뛰기":
             body = (
-                f"사용자가 5분 사이 창을 {snap.switch_count}번이나 정신없이 "
+                f"사용자가 5분 사이 창을 {switch_count}번이나 정신없이 "
                 f"옮겨다니고 있어 (산만함/널뛰기). 지금 창은 '{win}'."
             )
-        elif trigger == TriggerType.FAKE_WORKING:
+        elif trigger_value == "가짜 일하기":
             body = (
                 f"사용자가 업무앱 '{win}'을 켜놓고 {idle_min}분째 아무 입력도 "
                 f"없이 가만히 있어 (가짜 일하기)."
             )
-        elif trigger == TriggerType.PERSONAL_WEAKNESS:
+        elif trigger_value == "개인 약점 앱":
             body = (
                 f"사용자가 평소 자주 무너진다던 '{win}'에 또 빠졌어 "
                 f"(개인 약점 앱) — 약점인 거 콕 집어서 잔소리해."
             )
-        else:  # OVER_IMMERSION
+        else:  # "과몰입 딴짓" 또는 알 수 없는 신규 트리거
             body = (
                 f"사용자가 '{win}'(게임/메신저류)에 30분 넘게 고강도로 "
                 f"빠져 있어 (과몰입 딴짓)."
             )
         return body + goal_note
+
+    # ============================================== 원격 트리거 (위성)
+    def handle_remote_trigger(self, body: dict) -> dict:
+        """로컬 PC 트래커 위성(trigger_satellite.py)에서 보낸 트리거를 처리.
+        HTTP /trigger 핸들러에서 호출됨. _on_trigger 의 클라우드 버전 —
+        Tracker 상태 머신은 위성 쪽이 갖고 있고, 여기선 잔소리만 만들어 발송."""
+        trigger_value = str(body.get("trigger", "")).strip()
+        snap = body.get("snapshot") or {}
+        freq = body.get("window_freq")
+        if not trigger_value:
+            return {"ok": False, "action": "skipped", "reason": "missing_trigger"}
+
+        chat_id = self._store.chat_id
+        if chat_id is None:
+            return {"ok": False, "action": "skipped", "reason": "no_user_registered"}
+
+        goals = self._store.today_goals
+        goal = ", ".join(goals) if goals else None
+
+        # 산만함 트리거는 LLM 에 한 번 더 '진짜 딴짓인지' 확인 (로컬 _on_trigger 동일 로직)
+        if trigger_value == "산만함/널뛰기":
+            if not freq:
+                print("[App] (원격) 산만함 트리거에 window_freq 누락 — 스킵")
+                return {"ok": True, "action": "skipped", "reason": "no_freq"}
+            try:
+                if not self._agent.judge_distracted(goal, freq):
+                    print(f"[App] (원격) 산만함 판독: 업무 중 — 스킵 ({freq})")
+                    return {"ok": True, "action": "skipped", "reason": "judged_focused"}
+            except AIGenerationError as exc:
+                print(f"[App] (원격) 산만함 판독 실패 — 스킵: {exc}")
+                return {"ok": True, "action": "skipped", "reason": "ai_error"}
+            print(f"[App] (원격) 산만함 판독: 딴짓 확정 ({freq})")
+
+        description = self._describe_trigger(trigger_value, snap, goal)
+        if self._ignored_nags >= 1:
+            description += (
+                f" (사용자가 잔소리를 이미 {self._ignored_nags}번 무시하고 "
+                f"또 딴짓 중 — 점점 더 세게, 매번 다른 각도로 쪼아라.)"
+            )
+        try:
+            reply = self._agent.handle_event(description)
+        except AIGenerationError as exc:
+            self._note_ai_failure(chat_id, exc)
+            return {"ok": False, "action": "failed", "reason": "ai_error"}
+
+        self._consecutive_ai_failures = 0
+        print(f"[App] (원격) 트리거 [{trigger_value}] → 잔소리 발송")
+        self._send(chat_id, reply)
+        self._arm_warning_timeout()
+        return {"ok": True, "action": "nag_sent"}
 
     # ====================================================== 도구 콜백
     # (CoachAgent의 function calling이 대화 중 호출 → 여기로 들어옴)
@@ -522,6 +642,33 @@ class CoachApp:
             msg = f"⏰ 알람: {text}"
         print(f"[App] 알람 발송: {text}")
         self._send(chat_id, msg)
+
+    # ============================================== 원격 트리거 HTTP 서버
+    def _start_http_server(self) -> None:
+        """원격 트리거 HTTP 서버를 데몬 스레드로 띄운다. TRIGGER_SECRET 이
+        설정돼 있을 때만 활성 — 시크릿 없이 띄우면 누구나 트리거를 발사할 수
+        있으므로 안전을 위해 비활성. PORT 환경변수는 Railway 가 자동 주입한다."""
+        secret = os.getenv("TRIGGER_SECRET", "").strip()
+        if not secret:
+            print("[App] TRIGGER_SECRET 미설정 — 원격 트리거 endpoint 비활성")
+            return
+        port = int(os.getenv("PORT", "8080"))
+        handler_cls = type(
+            "TriggerHandler",
+            (_TriggerHTTPHandler,),
+            {"coach_app": self, "trigger_secret": secret},
+        )
+        try:
+            server = http.server.ThreadingHTTPServer(
+                ("0.0.0.0", port), handler_cls
+            )
+        except Exception as exc:
+            print(f"[App] HTTP 서버 시작 실패 (포트 {port}): {exc}")
+            return
+        threading.Thread(
+            target=server.serve_forever, name="TriggerHTTP", daemon=True
+        ).start()
+        print(f"[App] 원격 트리거 HTTP 서버 시작 — 포트 {port}, POST /trigger")
 
     # ====================================================== 매일 재시작
     def _daily_restart_loop(self) -> None:
