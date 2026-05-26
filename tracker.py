@@ -57,6 +57,71 @@ ADDICTIVE_KEYWORDS = (
 )
 
 
+# 약점 키워드의 한·영 변형 매핑. 사용자가 "유튜브" 한 단어로 등록해도 크롬
+# 창 제목 "...YouTube..." 와 매칭되도록. 각 키는 lowercase, 값은 함께 매칭할
+# 변형 라벨들 (lowercase 비교). 새 변형은 자유롭게 추가.
+_WEAK_KEYWORD_EXPANSIONS = {
+    # 영상·SNS
+    "유튜브": ["youtube"],
+    "유투브": ["youtube"],
+    "youtube": ["유튜브", "유투브"],
+    "인스타": ["instagram", "인스타그램"],
+    "인스타그램": ["instagram", "인스타"],
+    "instagram": ["인스타", "인스타그램"],
+    "틱톡": ["tiktok"],
+    "tiktok": ["틱톡"],
+    "페북": ["facebook", "페이스북"],
+    "페이스북": ["facebook", "페북"],
+    "facebook": ["페북", "페이스북"],
+    "트위터": ["twitter", "x.com", "엑스"],
+    "엑스": ["twitter", "x.com", "트위터"],
+    "twitter": ["트위터", "x.com"],
+    "x.com": ["트위터", "twitter"],
+    "넷플릭스": ["netflix"],
+    "netflix": ["넷플릭스"],
+    "트위치": ["twitch"],
+    "twitch": ["트위치"],
+    "치지직": ["chzzk"],
+    "chzzk": ["치지직"],
+    "레딧": ["reddit"],
+    "reddit": ["레딧"],
+    "스냅챗": ["snapchat"],
+    "snapchat": ["스냅챗"],
+    # 메신저
+    "카톡": ["kakaotalk", "카카오톡"],
+    "카카오톡": ["kakaotalk", "카톡"],
+    "kakaotalk": ["카톡", "카카오톡"],
+    "디스코드": ["discord"],
+    "discord": ["디스코드"],
+    "라인": ["line"],
+    "line": ["라인"],
+    "밴드": ["band"],
+    "band": ["밴드"],
+    # 한국 커뮤니티·쇼핑
+    "디시": ["dcinside", "디씨", "디시인사이드"],
+    "디씨": ["dcinside", "디시", "디시인사이드"],
+    "디시인사이드": ["dcinside", "디시", "디씨"],
+    "에펨코리아": ["fmkorea"],
+    "쿠팡": ["coupang"],
+    "당근": ["daangn"],
+    "웹툰": ["webtoon", "comic"],
+}
+
+
+def matches_weak_keyword(keyword: str, title_lower: str) -> bool:
+    """약점 키워드가 active window title 에 매칭되는지 — 한·영 변형 모두 시도.
+    title_lower 는 *이미 lowercase* 된 문자열을 받는다 (호출자가 처리)."""
+    kw = (keyword or "").strip().lower()
+    if not kw:
+        return False
+    if kw in title_lower:
+        return True
+    for variant in _WEAK_KEYWORD_EXPANSIONS.get(kw, ()):
+        if variant.lower() in title_lower:
+            return True
+    return False
+
+
 # =================================================================
 # Sanitization — LLM 판독용 라벨링.
 # 창 제목에서 식별 정보(파일명·검색어·대화방·페이지 제목)는 모두 제거하고
@@ -450,9 +515,10 @@ class Tracker:
         else:
             self._scroll_started = None
 
-        # Trigger 7: 개인 약점 앱 — 프로필에서 학습한 약점 앱에 3분 머무름
+        # Trigger 7: 개인 약점 앱 — 프로필에서 학습한 약점 앱에 3분 머무름.
+        # 한·영 변형 매핑으로 "유튜브" 등록해도 크롬 "YouTube" 창에 매칭.
         weak = [w for w in self._get_weak_spots() if w]
-        if weak and any(w.lower() in title for w in weak):
+        if weak and any(matches_weak_keyword(w, title) for w in weak):
             if self._weakness_started is None:
                 self._weakness_started = time.time()
             elif (time.time() - self._weakness_started) >= self.WEAKNESS_DWELL_SEC:
