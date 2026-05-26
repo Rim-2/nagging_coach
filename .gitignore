@@ -27,6 +27,10 @@ Thumbs.db
 # === 로컬 위성 실행 로그 (Windows 시작프로그램에서 자동 실행될 때 stdout 받아둠) ===
 satellite.log
 
+# === 발표·시연 자료 (외부 공개 금지) ===
+DEMO_SCRIPT.md
+*.demo.md
+
 # === Android 위성 빌드 산출물 ===
 android-satellite/.gradle/
 android-satellite/build/
