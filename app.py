@@ -31,6 +31,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
+from agent_tools import FOCUS_END_MARKER
 from ai_engine import AIGenerationError, CoachAgent
 from calendar_client import CalendarClient
 from store import Store
@@ -313,7 +314,9 @@ class CoachApp:
         self._send(
             chat_id,
             "안녕! 난 너의 잔소리 코치야 😎\n"
-            "앞으로 여기서 같이 떠들면서 오늘 할 일 챙겨줄게. "
+            "앞으로 여기서 같이 떠들면서 오늘 할 일 챙겨줄게.\n"
+            "(미리 알려둘게 — 난 AI 챗봇이야. 친구처럼 떠들고 잔소리도 해주지만, "
+            "정신과 진단·치료 도구는 아니야. 진짜 힘들 땐 사람한테 꼭 도움 받자.)\n"
             + pc_note
             + "자, 오늘 뭐 할 거야?",
         )
@@ -466,8 +469,8 @@ class CoachApp:
         if policy == "gentle":
             return (
                 f" (사용자가 잔소리를 {n}번 답 없이 지나갔어 — 더 다그치지 말고 "
-                f"'좀 힘들어?' 같이 안부 한 번 살피거나, 행동을 더 잘게 쪼개서 "
-                f"부담 없이 권해.)"
+                f"가만히 옆에 있어주거나, 행동을 잘게 쪼개 한 발만 권해. '좀 "
+                f"힘들어?' 같은 직접 질문은 피해 — 컨디션 안 좋을 땐 그것도 부담.)"
             )
         if policy == "strict":
             return (
@@ -727,12 +730,21 @@ class CoachApp:
 
     def _fire_alarm(self, chat_id: int, alarm: dict) -> None:
         text = alarm.get("text", "알람")
-        try:
-            msg = self._agent.deliver_alarm(text)
-        except AIGenerationError as exc:
-            print(f"[App] 알람 메시지 생성 실패 — 기본 문구 사용: {exc}")
-            msg = f"⏰ 알람: {text}"
-        print(f"[App] 알람 발송: {text}")
+        if text.startswith(FOCUS_END_MARKER):
+            what = text[len(FOCUS_END_MARKER):].strip() or "집중 작업"
+            try:
+                msg = self._agent.focus_session_end(what)
+            except AIGenerationError as exc:
+                print(f"[App] focus 세션 종료 메시지 생성 실패: {exc}")
+                msg = f"⏰ '{what}' 집중 세션 끝났어! 어땠어? 더 갈래, 쉴래, 끝낼래?"
+            print(f"[App] focus 세션 종료 발송: {what}")
+        else:
+            try:
+                msg = self._agent.deliver_alarm(text)
+            except AIGenerationError as exc:
+                print(f"[App] 알람 메시지 생성 실패 — 기본 문구 사용: {exc}")
+                msg = f"⏰ 알람: {text}"
+            print(f"[App] 알람 발송: {text}")
         self._send(chat_id, msg)
 
     # ============================================== 원격 트리거 HTTP 서버

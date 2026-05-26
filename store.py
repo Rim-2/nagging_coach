@@ -36,17 +36,30 @@ def _aggregate_buckets(buckets: List[dict]) -> dict:
     goals_completed = 0
     goals_registered = 0
     habit_dones = 0
+    mood_ratings: List[int] = []
+    mood_notes: List[str] = []
     for b in buckets:
         for label, cnt in (b.get("triggers") or {}).items():
             triggers[label] = triggers.get(label, 0) + int(cnt or 0)
         goals_completed += int(b.get("goals_completed") or 0)
         goals_registered += int(b.get("goals_registered") or 0)
         habit_dones += int(b.get("habit_dones") or 0)
+        for log in (b.get("mood_logs") or []):
+            try:
+                mood_ratings.append(int(log.get("rating", 0)))
+                note = str(log.get("note", "")).strip()
+                if note:
+                    mood_notes.append(note)
+            except Exception:
+                continue
     trigger_total = sum(triggers.values())
     top_trigger = max(triggers.items(), key=lambda x: x[1])[0] if triggers else ""
     # 완료율은 분모(등록) 가 0 이면 None — '데이터 부족'으로 표시할 수 있게.
     completion_rate: Optional[float] = (
         goals_completed / goals_registered if goals_registered > 0 else None
+    )
+    mood_avg: Optional[float] = (
+        sum(mood_ratings) / len(mood_ratings) if mood_ratings else None
     )
     return {
         "trigger_total": trigger_total,
@@ -56,6 +69,9 @@ def _aggregate_buckets(buckets: List[dict]) -> dict:
         "goals_registered": goals_registered,
         "completion_rate": completion_rate,
         "habit_dones": habit_dones,
+        "mood_avg": mood_avg,
+        "mood_count": len(mood_ratings),
+        "mood_notes_recent": mood_notes[-3:],  # 가장 최근 3개 메모
     }
 
 
@@ -82,6 +98,7 @@ class Store:
             "daily_stats": {},
             "last_weekly_review": None,
             "last_overload_checkin": None,
+            "implementation_intentions": [],
         }
         self._load()
 
@@ -315,6 +332,7 @@ class Store:
                 "goals_completed": 0,
                 "goals_registered": 0,
                 "habit_dones": 0,
+                "mood_logs": [],
             }
             stats[today] = bucket
             # 오래된 날짜 자동 정리
@@ -322,6 +340,24 @@ class Store:
                 for k in sorted(stats.keys())[: len(stats) - self.DAILY_STATS_MAX_DAYS]:
                     stats.pop(k, None)
         return bucket
+
+    def add_mood_log(self, rating: int, note: str = "") -> None:
+        """오늘 자 통계에 가벼운 mood 기록 (1~5) + 메모. behavioral activation
+        의 핵심 — 활동-기분 연결을 weekly_summary 에서 사용자에게 돌려준다."""
+        try:
+            r = int(rating)
+        except Exception:
+            return
+        r = max(1, min(5, r))
+        with self._lock:
+            bucket = self._today_bucket()
+            logs = bucket.setdefault("mood_logs", [])
+            logs.append({
+                "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                "rating": r,
+                "note": (note or "").strip()[:200],
+            })
+            self._persist()
 
     def bump_trigger_fire(self, trigger_value: str) -> None:
         """잔소리가 실제 발송된 트리거를 오늘 자 통계에 +1. 쿨다운으로 스킵된
@@ -364,6 +400,51 @@ class Store:
             "recent": _aggregate_buckets(recent_buckets),
             "previous": _aggregate_buckets(previous_buckets),
         }
+
+    # --------------------------------------------------- WOOP if-then plan
+    @property
+    def implementation_intentions(self) -> List[dict]:
+        """미리 정해둔 if-then plan 목록 (얕은 복사본).
+        WOOP/MCII 의 Plan 단계 — '상황 X 가 오면 행동 Y 한다' 식 자동 반응."""
+        with self._lock:
+            return [dict(p) for p in self._data["implementation_intentions"]]
+
+    def add_implementation_intention(
+        self, situation: str, response: str, related_goal: Optional[str] = None
+    ) -> bool:
+        sit = (situation or "").strip()
+        resp = (response or "").strip()
+        if not sit or not resp:
+            return False
+        with self._lock:
+            for p in self._data["implementation_intentions"]:
+                if p["situation"].lower() == sit.lower():
+                    return False  # 같은 situation 중복 X
+            self._data["implementation_intentions"].append({
+                "situation": sit,
+                "response": resp,
+                "related_goal": (related_goal or "").strip() or None,
+                "created": datetime.date.today().isoformat(),
+            })
+            self._persist()
+            return True
+
+    def remove_implementation_intention(self, key_substring: str) -> int:
+        """situation 또는 response 부분 일치하는 plan 제거. 제거된 갯수 반환."""
+        key = (key_substring or "").strip().lower()
+        if not key:
+            return 0
+        with self._lock:
+            before = len(self._data["implementation_intentions"])
+            self._data["implementation_intentions"] = [
+                p for p in self._data["implementation_intentions"]
+                if key not in p["situation"].lower()
+                and key not in p["response"].lower()
+            ]
+            removed = before - len(self._data["implementation_intentions"])
+            if removed:
+                self._persist()
+            return removed
 
     # --------------------------------------------------------- 주간 회고
     @property
@@ -523,7 +604,8 @@ class Store:
             self._persist()
 
     def clear_conversation(self) -> None:
-        """대화 기록·목표·진행 메모를 비운다. chat_id는 유지한다."""
+        """대화 기록·목표·진행 메모를 비운다. chat_id 와 nag_policy/daily_stats
+        같은 사용자 설정·누적 데이터는 유지한다."""
         with self._lock:
             self._data["history"] = []
             self._data["today_goals"] = []
@@ -534,4 +616,5 @@ class Store:
             self._data["weak_spots"] = []
             self._data["alarms"] = []
             self._data["habits"] = []
+            self._data["implementation_intentions"] = []
             self._persist()

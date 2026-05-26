@@ -197,6 +197,110 @@ def build_tools(
         run=lambda args: _advance_today_goal_step(store, args),
     )
 
+    # ---- WOOP / Implementation intention: 약점에 대한 if-then plan ----
+    tools["register_implementation_intention"] = Tool(
+        types.FunctionDeclaration(
+            name="register_implementation_intention",
+            description=(
+                "WOOP/MCII 의 Plan 단계 — 사용자가 '만약 X 상황이 오면 그땐 Y "
+                "한다' 식 if-then 문장으로 자기 약점·습관 대응을 정리했을 때 "
+                "저장한다. Implementation intention 은 임상 연구에서 미루기·"
+                "습관 형성 효과 검증된 기법 (메타분석 g=0.34, 24 trials). "
+                "저장된 plan 들은 [상태 메모]에 노출되어 다음 대화·잔소리에서 "
+                "코치가 참고한다. WOOP 4단계 모두 끌어낸 뒤 Plan 이 충분히 "
+                "구체적일 때만 호출 — 모호한 다짐 X."
+            ),
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "situation": types.Schema(
+                        type="STRING",
+                        description=(
+                            "'언제/어떤 상황이 오면' — 구체적인 cue 여야 한다. "
+                            "예: '저녁 9시 이후 유튜브가 켜지면', '회의 끝나고 "
+                            "카톡을 보면', '코드가 막혀서 짜증날 때'."
+                        ),
+                    ),
+                    "response": types.Schema(
+                        type="STRING",
+                        description=(
+                            "'그때 어떻게 한다' — 구체 행동. 예: '핸드폰을 책상 "
+                            "서랍에 넣는다', '5분 산책 후 책상 앞에 다시 앉는다', "
+                            "'문제를 종이에 다시 적어본다'."
+                        ),
+                    ),
+                    "related_goal": types.Schema(
+                        type="STRING",
+                        description="(선택) 이 plan 이 어떤 목표·약점과 연결되는지",
+                    ),
+                },
+                required=["situation", "response"],
+            ),
+        ),
+        run=lambda args: _register_implementation_intention(store, args),
+    )
+
+    # ---- Focus session: Pomodoro 식 짧은 집중 타이머 (시작 장벽 ↓) ----
+    tools["start_focus_session"] = Tool(
+        types.FunctionDeclaration(
+            name="start_focus_session",
+            description=(
+                "사용자가 작업 시작을 어려워하거나 미루고 있을 때 짧은 집중 "
+                "타이머를 걸어준다 ('딱 N분만 해보자' 식). 끝나면 시스템이 "
+                "자동으로 사용자한테 '어땠어?' 알람을 띄운다. Pomodoro 식 "
+                "기법으로 시작 장벽을 낮춤. nag_policy 가 gentle 이면 10~15분, "
+                "balanced 20~25분, strict 25분 권장. 사용자가 더 짧게 원하면 "
+                "5분도 OK."
+            ),
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "minutes": types.Schema(
+                        type="INTEGER",
+                        description="타이머 분량 (5~50 범위, Pomodoro 식 권장 25)",
+                    ),
+                    "what": types.Schema(
+                        type="STRING",
+                        description="이 세션에서 할 작업 (예: '로그인 함수 print 추가')",
+                    ),
+                },
+                required=["minutes", "what"],
+            ),
+        ),
+        run=lambda args: _start_focus_session(store, args),
+    )
+
+    # ---- Mood log: 가벼운 활동-기분 연결 추적 (behavioral activation 핵심) ----
+    tools["log_mood"] = Tool(
+        types.FunctionDeclaration(
+            name="log_mood",
+            description=(
+                "사용자가 자기 기분·컨디션을 말하면 (좋다·우울하다·지쳤다·신난다 "
+                "등) 가벼운 mood log 로 저장한다. 사용자한테 명시적으로 '1~5점' "
+                "을 묻지 말고, 발화에서 자연스럽게 짐작해서 rating 을 정해라 "
+                "(1=아주 나쁨, 3=보통, 5=아주 좋음). note 에는 사용자가 그 "
+                "기분과 함께 언급한 활동/상황 한 줄 (예: '논문 끝내고 산책함', "
+                "'밤새 일하느라 지침'). 매 turn 호출하지 말고, 사용자가 직접 "
+                "기분 얘기 꺼냈을 때만."
+            ),
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "rating": types.Schema(
+                        type="INTEGER",
+                        description="1(아주 나쁨)~5(아주 좋음) 추정값",
+                    ),
+                    "note": types.Schema(
+                        type="STRING",
+                        description="(선택) 기분 맥락 — 함께 언급된 활동/상황",
+                    ),
+                },
+                required=["rating"],
+            ),
+        ),
+        run=lambda args: _log_mood(store, args),
+    )
+
     # ---- 주간 인사이트: 격려·칭찬에 구체적 근거 제공 ----
     tools["get_weekly_insight"] = Tool(
         types.FunctionDeclaration(
@@ -394,6 +498,64 @@ def _advance_today_goal_step(store, args: dict) -> str:
     )
 
 
+# ---------------------------------------------------- Implementation intention
+def _register_implementation_intention(store, args: dict) -> str:
+    situation = str(args.get("situation", "")).strip()
+    response = str(args.get("response", "")).strip()
+    related = str(args.get("related_goal", "")).strip() or None
+    if not situation:
+        return "실패: situation 이 필요하다."
+    if not response:
+        return "실패: response 가 필요하다."
+    if store.add_implementation_intention(situation, response, related):
+        tail = f" (목표: {related})" if related else ""
+        return (
+            f"성공: if-then plan 저장 — '{situation}' → '{response}'{tail}. "
+            f"다음에 그 상황 오면 같이 챙길게."
+        )
+    return f"비슷한 상황의 plan 이 이미 등록되어 있어 — '{situation}'."
+
+
+# ---------------------------------------------------------- Focus session
+FOCUS_END_MARKER = "[FOCUS_END]"  # alarm text 가 이걸로 시작하면 _fire_alarm 분기
+
+
+def _start_focus_session(store, args: dict) -> str:
+    try:
+        minutes = int(args.get("minutes", 0))
+    except Exception:
+        return "실패: minutes 는 정수가 필요하다 (5~50 권장)."
+    if not (1 <= minutes <= 120):
+        return "실패: minutes 는 1~120 범위만 허용."
+    what = str(args.get("what", "")).strip() or "집중 작업"
+    next_ts = datetime.datetime.now().timestamp() + minutes * 60
+    label = f"{minutes}분 집중 세션"
+    # 알람 text 에 마커를 박아 _fire_alarm 이 specialized 메시지를 만든다.
+    store.add_alarm({
+        "text": f"{FOCUS_END_MARKER} {what}",
+        "repeat": "once",
+        "next_ts": next_ts,
+        "label": label,
+    })
+    return (
+        f"성공: '{what}' {minutes}분 타이머 시작 — 끝나면 시스템이 다시 "
+        f"'어땠어?' 물어볼게."
+    )
+
+
+# ------------------------------------------------------------ Mood log
+def _log_mood(store, args: dict) -> str:
+    try:
+        rating = int(args.get("rating", 0))
+    except Exception:
+        return "실패: rating 은 1~5 정수가 필요하다."
+    if not (1 <= rating <= 5):
+        return "실패: rating 은 1~5 범위만."
+    note = str(args.get("note", "")).strip()
+    store.add_mood_log(rating, note)
+    return f"성공: mood {rating}/5 기록" + (f" (메모: {note[:60]})" if note else "") + "."
+
+
 # ---------------------------------------------------------- 주간 인사이트
 def _get_weekly_insight(store) -> str:
     """지난 7일 vs 그 전 7일 누적 비교를 한 줄 자연어로. 코치가 칭찬·격려에
@@ -426,6 +588,23 @@ def _get_weekly_insight(store) -> str:
             f"{ ' — 캐파에 비해 분량이 과한 신호, 다음 과제는 더 잘게 쪼개라' if rate < 0.4 else '' }"
         )
 
+    mood_line = ""
+    if rec.get("mood_count", 0) > 0:
+        avg = rec["mood_avg"]
+        prev_avg = prev.get("mood_avg")
+        if prev_avg is not None:
+            diff = avg - prev_avg
+            sign = "+" if diff > 0 else ""
+            mood_line = (
+                f" Mood 평균 {avg:.1f}/5 (지난주 {prev_avg:.1f}, {sign}{diff:.1f}, "
+                f"{rec['mood_count']}회 기록)."
+            )
+        else:
+            mood_line = f" Mood 평균 {avg:.1f}/5 ({rec['mood_count']}회 기록)."
+        notes = rec.get("mood_notes_recent") or []
+        if notes:
+            mood_line += " 최근 메모: " + "; ".join(f'"{n}"' for n in notes) + "."
+
     return (
         f"최근 7일 — {rate_line}; "
         f"목표 완료 {rec['goals_completed']}회 "
@@ -435,6 +614,7 @@ def _get_weekly_insight(store) -> str:
         f"잔소리 트리거 {rec['trigger_total']}회 "
         f"({_delta(rec['trigger_total'], prev['trigger_total'])}, 적을수록 좋음). "
         f"가장 자주 잡힌 패턴: '{rec['top_trigger'] or '-'}'."
+        f"{mood_line}"
     )
 
 
