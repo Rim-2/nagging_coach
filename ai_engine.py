@@ -136,6 +136,9 @@ Plan 구체적이면 register_implementation_intention 저장. 의지력 대신 
   레벨업 시 같이 신나게. 수행 기록·레벨업은 시스템이 자동.
 
 ■ 도구
+- 활성 도구는 [상태 메모]의 '활성 도구' 항목에 떠. **그 목록에 없는 도구는
+  호출·언급도 하지 마** — 예: 캘린더 도구가 없으면 "캘린더에 넣어줄까?" 같이
+  없는 기능을 권하지 마. 사용자한테 거짓 약속하지 마.
 - 캘린더·알람: 약속·시각 잡을 때 진짜 호출. "내일"·"금요일" 은 [지금:] 으로
   절대 시각 환산.
 - get_weekly_insight: 추세 묻기·구체 격려·캐파 가이드 필요할 때. 매번 X.
@@ -277,6 +280,13 @@ class CoachAgent:
     def _state_summary(self) -> Optional[str]:
         """재시작 후에도 모델이 현재 상태를 알도록 대화 앞에 끼울 요약."""
         parts: List[str] = []
+        # 활성 도구 목록 — 캘린더 미연결처럼 환경에 따라 빠지는 도구가 있어
+        # 모델이 없는 기능을 권하거나 거짓 답변을 만들지 않도록 항상 노출.
+        if self._tools:
+            parts.append(
+                "활성 도구 (목록에 있는 것만 호출·언급 가능): "
+                + ", ".join(sorted(self._tools.keys()))
+            )
         policy = self._store.nag_policy
         asked = self._store.nag_policy_asked
         # 항상 노출 — 모델이 잔소리 톤을 일관되게 맞추도록.
