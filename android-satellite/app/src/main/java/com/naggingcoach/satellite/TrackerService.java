@@ -9,6 +9,8 @@ import android.app.Service;
 import android.app.usage.UsageEvents;
 import android.app.usage.UsageStatsManager;
 import android.content.Intent;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -82,8 +84,10 @@ public class TrackerService extends Service {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Map<String, Long> lastFireMs = new HashMap<>();
+    private final Map<String, String> labelCache = new HashMap<>();
     private UsageStatsManager usm;
     private PowerManager pm;
+    private PackageManager packageManager;
 
     // 화면 ON/OFF 누적 추적 (분 단위, POLL_INTERVAL_MS 가 1분이라 그냥 1씩)
     private int sustainedUseMin = 0;
@@ -107,6 +111,7 @@ public class TrackerService extends Service {
         super.onCreate();
         usm = (UsageStatsManager) getSystemService(USAGE_STATS_SERVICE);
         pm = (PowerManager) getSystemService(POWER_SERVICE);
+        packageManager = getPackageManager();
         createNotificationChannel();
     }
 
@@ -238,12 +243,66 @@ public class TrackerService extends Service {
             }
             Long pause = lastPause.get(pkg);
             if (pause != null && pause > resume) {
-                result.put(pkg, pause - resume);  // 끝난 세션 길이
+                // 이미 끝난 세션 — 사용자가 이미 폰 내려놨으니 잔소리 의미 없음.
+                // (Railway 재시작 시 옛 세션이 또 발사되던 버그 fix)
+                result.put(pkg, 0L);
             } else {
-                result.put(pkg, now - resume);    // 현재 포그라운드 — 진행 중
+                // 현재 포그라운드 — 진행 중인 세션만 잡는다 (PC tracker 의
+                // active_window 만 보는 사상과 일치)
+                result.put(pkg, now - resume);
             }
         }
         return result;
+    }
+
+    /**
+     * 패키지명 → 사용자 OS 에 등록된 앱 표시 이름. 첫 호출 후 캐싱.
+     * 못 찾으면 패키지명 그대로 fall-back.
+     */
+    private String getAppLabel(String pkg) {
+        String cached = labelCache.get(pkg);
+        if (cached != null) {
+            return cached;
+        }
+        String label = pkg;
+        try {
+            ApplicationInfo info = packageManager.getApplicationInfo(pkg, 0);
+            CharSequence cs = packageManager.getApplicationLabel(info);
+            if (cs != null) {
+                label = cs.toString();
+            }
+        } catch (PackageManager.NameNotFoundException ignored) {
+            // 앱 미설치 — 패키지명 그대로
+        } catch (Throwable ignored) {
+            // 안전망 — 어떤 이유로든 실패 시 패키지명
+        }
+        labelCache.put(pkg, label);
+        return label;
+    }
+
+    /** JSON body 직렬화 시 특수문자 escape (앱 라벨에 따옴표·백슬래시 가능). */
+    private static String escapeJson(String s) {
+        if (s == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(s.length() + 8);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '\\': sb.append("\\\\"); break;
+                case '"':  sb.append("\\\""); break;
+                case '\n': sb.append(' '); break;
+                case '\r': sb.append(' '); break;
+                case '\t': sb.append(' '); break;
+                default:
+                    if (c < 0x20) {
+                        sb.append(' ');
+                    } else {
+                        sb.append(c);
+                    }
+            }
+        }
+        return sb.toString();
     }
 
     private void tryFire(String triggerValue, String appPkg, long totalMs, long now) {
@@ -272,10 +331,13 @@ public class TrackerService extends Service {
             conn.setReadTimeout(20_000);
 
             int sessionMinutes = (int) (totalMs / 60_000L);
+            // OS 에 등록된 앱 표시 이름 (한국어 OS면 한글). phone-screen 같은
+            // 가상 라벨은 패키지매니저에 없어서 그대로 통과.
+            String label = appPkg.contains(".") ? getAppLabel(appPkg) : appPkg;
             String body = "{"
-                    + "\"trigger\":\"" + triggerValue + "\","
+                    + "\"trigger\":\"" + escapeJson(triggerValue) + "\","
                     + "\"snapshot\":{"
-                    + "\"active_window\":\"" + appPkg + "\","
+                    + "\"active_window\":\"" + escapeJson(label) + "\","
                     + "\"idle_time\":0,"
                     + "\"switch_count\":0,"
                     + "\"session_minutes\":" + sessionMinutes
