@@ -446,7 +446,8 @@ class CoachAgent:
 
     def proactive_checkin(self) -> str:
         """사용자가 한동안 조용할 때, 코치가 먼저 말을 거는 메시지를 생성한다.
-        안 끝낸 오늘 목표가 있으면 그걸 콕 집어 챙긴다."""
+        안 끝낸 오늘 목표가 있으면 그걸 콕 집어 챙기고, 다가오는 일정이 있으면
+        자연스럽게 한 번 상기시킨다 (강요 X)."""
         with self._lock:
             goals = self._store.today_goals
             if goals:
@@ -462,8 +463,15 @@ class CoachAgent:
                     "안 끝낸 오늘 목표는 없어 — '뭐 하느라 조용해?' 하고 "
                     "안부나 가볍게 떠봐."
                 )
+            upcoming = self._upcoming_events_summary()
+            upcoming_note = (
+                f" 참고 — {upcoming}. 잊지 않게 자연스럽게 한 번 슬쩍 끼워 "
+                "상기시켜도 좋아 (강요 X, 그날 목표 챙기는 본문에 가볍게 곁들이는 정도)."
+                if upcoming
+                else ""
+            )
             prompt = (
-                f"[자동 트리거] 사용자가 한참 답이 없어. {goal_line} "
+                f"[자동 트리거] 사용자가 한참 답이 없어. {goal_line}{upcoming_note} "
                 "다그치지 말고 친구처럼 가볍게, 한두 문장으로. 너무 늦은 "
                 "시각이면 무리시키지 말고 쉬라고 해."
             )
