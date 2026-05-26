@@ -29,8 +29,22 @@ jobs:
         uses: gradle/actions/setup-gradle@v3
 
       - name: Build Debug APK
+        id: build
         working-directory: ./android-satellite
-        run: gradle assembleDebug --stacktrace --no-daemon
+        continue-on-error: true
+        run: |
+          gradle assembleDebug --stacktrace --no-daemon 2>&1 | tee build-output.log
+
+      - name: Show compiler errors only (if build failed)
+        if: steps.build.outcome == 'failure'
+        working-directory: ./android-satellite
+        run: |
+          echo "=== Compiler errors ==="
+          grep -E "error:|FAILED|Caused by|Exception in" build-output.log | head -80 || true
+          echo "=== Last 80 lines of build output ==="
+          tail -80 build-output.log
+          echo "=== End ==="
+          exit 1
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
