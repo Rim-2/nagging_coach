@@ -705,23 +705,26 @@ class CoachApp:
         print(f"[App] (원격) 트리거 [{trigger_value}] → 잔소리 발송")
         sent_ok = self._send(chat_id, reply)
         self._arm_warning_timeout()
+        if not sent_ok:
+            # 텔레그램 전송 실패 — 사용자가 받지 못했으므로 쿨다운·통계·학습 모두
+            # 적용 안 함. 다음 트리거 시도가 즉시 가능해야 시연/운영 흐름이 안 깨짐.
+            return {"ok": False, "action": "failed", "reason": "telegram_send_failed"}
         with self._remote_cooldown_lock:
             self._remote_cooldowns[trigger_value] = (
                 time.time() + REMOTE_TRIGGER_COOLDOWN_SEC
             )
-        if sent_ok:
-            self._store.bump_trigger_fire(trigger_value)
-            # 자기학습 weak_spot 후보 — 폰 위성이 보낸 active_window (앱 패키지명)
-            app_label = snap.get("active_window") or ""
-            if app_label:
-                self._store.bump_weak_spot_candidate(app_label)
-            # 늦은 밤은 하루 한 번 — 발사 성공 시 오늘 날짜 마크
-            if trigger_value == "늦은 밤":
-                self._store.last_late_night_fired = (
-                    datetime.datetime.now().date().isoformat()
-                )
-            if not self._store.nag_policy_asked:
-                self._store.nag_policy_asked = True
+        self._store.bump_trigger_fire(trigger_value)
+        # 자기학습 weak_spot 후보 — 폰 위성이 보낸 active_window (앱 패키지명)
+        app_label = snap.get("active_window") or ""
+        if app_label:
+            self._store.bump_weak_spot_candidate(app_label)
+        # 늦은 밤은 하루 한 번 — 발사 성공 시 오늘 날짜 마크
+        if trigger_value == "늦은 밤":
+            self._store.last_late_night_fired = (
+                datetime.datetime.now().date().isoformat()
+            )
+        if not self._store.nag_policy_asked:
+            self._store.nag_policy_asked = True
         return {"ok": True, "action": "nag_sent"}
 
     # ====================================================== 도구 콜백
