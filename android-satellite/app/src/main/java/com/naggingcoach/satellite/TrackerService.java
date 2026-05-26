@@ -6,7 +6,7 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
-import android.app.usage.UsageStats;
+import android.app.usage.UsageEvents;
 import android.app.usage.UsageStatsManager;
 import android.content.Intent;
 import android.os.Build;
@@ -22,11 +22,13 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.Calendar;
+import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
-import java.util.List;
+import java.util.HashSet;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 폰 활동 감시 위성 — PC 의 trigger_satellite.py 와 같은 역할.
@@ -164,30 +166,84 @@ public class TrackerService extends Service {
             tryFire("늦은 밤", "phone-screen", 0L, now);
         }
 
-        // --- 앱 사용 시간 기반 트리거 (능동 도파민 / 과몰입) ---
-        List<UsageStats> stats = usm.queryUsageStats(
-                UsageStatsManager.INTERVAL_DAILY, now - WINDOW_MS, now);
-        if (stats == null || stats.isEmpty()) {
-            return;
-        }
+        // --- 약점 앱 *현재/마지막 세션 길이* 측정 (누적 X) ---
+        // 오늘 누적 시간으로 잡으면 알림 답장 누적 등으로 일상 사용도 발사됨.
+        // PC tracker 의 OVER_IMMERSION 처럼 *연속* 세션으로만 잡아야 한다.
+        Set<String> allTargets = new HashSet<>();
+        Collections.addAll(allTargets, DOPAMINE_APPS);
+        Collections.addAll(allTargets, ADDICTIVE_APPS);
+        Map<String, Long> sessions = getCurrentSessionsMs(allTargets, now);
 
-        for (UsageStats s : stats) {
-            String pkg = s.getPackageName();
-            long total = s.getTotalTimeInForeground();
-            if (total <= 0) {
+        for (Map.Entry<String, Long> entry : sessions.entrySet()) {
+            String pkg = entry.getKey();
+            long sessionMs = entry.getValue();
+            if (sessionMs <= 0) {
                 continue;
             }
 
-            // 능동 도파민 스크롤
-            if (total >= DOPAMINE_THRESHOLD_MS && contains(DOPAMINE_APPS, pkg)) {
-                tryFire("능동적 도파민 스크롤", pkg, total, now);
-                continue;  // 같은 앱이 두 카테고리 둘 다일 일은 거의 없음
+            // 능동 도파민 스크롤 — 영상·SNS 앱 한 세션 N분
+            if (sessionMs >= DOPAMINE_THRESHOLD_MS
+                    && contains(DOPAMINE_APPS, pkg)) {
+                tryFire("능동적 도파민 스크롤", pkg, sessionMs, now);
+                continue;
             }
-            // 과몰입 딴짓
-            if (total >= ADDICTIVE_THRESHOLD_MS && contains(ADDICTIVE_APPS, pkg)) {
-                tryFire("과몰입 딴짓", pkg, total, now);
+            // 과몰입 딴짓 — 게임·메신저류 한 세션 N분
+            if (sessionMs >= ADDICTIVE_THRESHOLD_MS
+                    && contains(ADDICTIVE_APPS, pkg)) {
+                tryFire("과몰입 딴짓", pkg, sessionMs, now);
             }
         }
+    }
+
+    /**
+     * 약점 앱들의 *현재/마지막 세션 길이* (ms) 를 한 번의 queryEvents 호출로 계산.
+     *
+     * 알고리즘: WINDOW_MS 안의 이벤트를 훑어 각 앱별 *마지막* ACTIVITY_RESUMED 와
+     * ACTIVITY_PAUSED/STOPPED 시각을 기억.
+     *   - pause > resume: 이미 끝난 세션, 길이 = pause - resume
+     *   - pause 없거나 pause < resume: 현재 포그라운드, 길이 = now - resume
+     *   - resume 자체가 없으면: 0
+     *
+     * 즉 "오늘 누적" 이 아니라 *가장 최근 연속 세션 한 번* 의 길이만 반환.
+     * 다른 앱으로 잠깐 전환했다 돌아오면 새 세션으로 카운트 (PC tracker 의
+     * POST_RESUME_COOLDOWN 사상과 같음).
+     */
+    private Map<String, Long> getCurrentSessionsMs(Set<String> targets, long now) {
+        Map<String, Long> lastResume = new HashMap<>();
+        Map<String, Long> lastPause = new HashMap<>();
+
+        UsageEvents events = usm.queryEvents(now - WINDOW_MS, now);
+        UsageEvents.Event event = new UsageEvents.Event();
+        while (events.hasNextEvent()) {
+            events.getNextEvent(event);
+            String pkg = event.getPackageName();
+            if (pkg == null || !targets.contains(pkg)) {
+                continue;
+            }
+            int type = event.getEventType();
+            if (type == UsageEvents.Event.ACTIVITY_RESUMED) {
+                lastResume.put(pkg, event.getTimeStamp());
+            } else if (type == UsageEvents.Event.ACTIVITY_PAUSED
+                    || type == UsageEvents.Event.ACTIVITY_STOPPED) {
+                lastPause.put(pkg, event.getTimeStamp());
+            }
+        }
+
+        Map<String, Long> result = new HashMap<>();
+        for (String pkg : targets) {
+            Long resume = lastResume.get(pkg);
+            if (resume == null) {
+                result.put(pkg, 0L);
+                continue;
+            }
+            Long pause = lastPause.get(pkg);
+            if (pause != null && pause > resume) {
+                result.put(pkg, pause - resume);  // 끝난 세션 길이
+            } else {
+                result.put(pkg, now - resume);    // 현재 포그라운드 — 진행 중
+            }
+        }
+        return result;
     }
 
     private void tryFire(String triggerValue, String appPkg, long totalMs, long now) {
@@ -215,12 +271,14 @@ public class TrackerService extends Service {
             conn.setConnectTimeout(10_000);
             conn.setReadTimeout(20_000);
 
+            int sessionMinutes = (int) (totalMs / 60_000L);
             String body = "{"
                     + "\"trigger\":\"" + triggerValue + "\","
                     + "\"snapshot\":{"
                     + "\"active_window\":\"" + appPkg + "\","
                     + "\"idle_time\":0,"
-                    + "\"switch_count\":0"
+                    + "\"switch_count\":0,"
+                    + "\"session_minutes\":" + sessionMinutes
                     + "}}";
 
             try (OutputStream os = conn.getOutputStream()) {

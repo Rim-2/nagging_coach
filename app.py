@@ -535,17 +535,21 @@ class CoachApp:
         win = snap.get("active_window") or "(알 수 없는 창)"
         idle_min = int((snap.get("idle_time") or 0) // 60)
         switch_count = snap.get("switch_count") or 0
+        # 폰 위성은 실제 세션 분을 보냄. PC 위성은 안 보냄 → None.
+        # None 일 때만 각 트리거의 알려진 default (PC 의 임계치) 로 fall-back.
+        session_min = snap.get("session_minutes")
 
         # 수면·휴식 잔소리는 목표와 무관 — 본문만 돌려준다.
         if trigger_value == "늦은 밤":
             hour = datetime.datetime.now().hour
             return (
-                f"지금 새벽 {hour}시인데 사용자가 아직 PC 앞에서 안 자고 있어. "
+                f"지금 새벽 {hour}시인데 사용자가 아직 화면 앞에서 안 자고 있어. "
                 f"수면 챙기라고 한마디 해줘."
             )
         if trigger_value == "휴식 없는 과로":
+            mins = session_min if session_min and session_min > 0 else 120
             return (
-                "사용자가 2시간 넘게 쉬는 틈도 없이 계속 화면 앞에 붙어 있어. "
+                f"사용자가 {mins}분 넘게 쉬는 틈도 없이 계속 화면 앞에 붙어 있어. "
                 "눈도 몸도 지칠 텐데 — 잠깐 쉬라고 챙겨줘."
             )
 
@@ -559,8 +563,9 @@ class CoachApp:
                 f"사용자가 '{win}'을 {idle_min}분째 입력 없이 보고 있어."
             )
         elif trigger_value == "능동적 도파민 스크롤":
+            mins = session_min if session_min and session_min > 0 else 15
             body = (
-                f"사용자가 '{win}'을 15분 넘게 손 안 떼고 계속 보고 있어."
+                f"사용자가 '{win}'을 {mins}분 넘게 손 안 떼고 계속 보고 있어."
             )
         elif trigger_value == "산만함/널뛰기":
             body = (
@@ -577,8 +582,9 @@ class CoachApp:
                 f"사용자가 평소 자주 빠진다고 했던 '{win}'에 다시 들어왔어."
             )
         else:  # "과몰입 딴짓" 또는 알 수 없는 신규 트리거
+            mins = session_min if session_min and session_min > 0 else 30
             body = (
-                f"사용자가 '{win}'(게임/메신저류)에 30분 넘게 집중하고 있어."
+                f"사용자가 '{win}'(게임/메신저류)에 {mins}분 넘게 집중하고 있어."
             )
         return body + goal_note
 
