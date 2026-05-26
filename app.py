@@ -670,6 +670,15 @@ class CoachApp:
         goals = self._store.today_goals
         goal = ", ".join(goals) if goals else None
 
+        # 늦은 밤 트리거 — 하루 한 번만. 위성의 _late_night_fired_on 가 메모리
+        # 변수라 위성 재시작 시 reset 되어 또 발사 시도하므로, 백엔드가 영속
+        # 마크로 막는다 (트리거 종류별 10분 쿨다운보다 강한 제약).
+        if trigger_value == "늦은 밤":
+            today_s = datetime.datetime.now().date().isoformat()
+            if self._store.last_late_night_fired == today_s:
+                print(f"[App] (원격) 늦은 밤 트리거 — 오늘 이미 발사됨, 스킵")
+                return {"ok": True, "action": "skipped", "reason": "late_night_already_fired_today"}
+
         # 산만함 트리거는 LLM 에 한 번 더 '진짜 딴짓인지' 확인 (로컬 _on_trigger 동일 로직)
         if trigger_value == "산만함/널뛰기":
             if not freq:
@@ -706,6 +715,11 @@ class CoachApp:
             app_label = snap.get("active_window") or ""
             if app_label:
                 self._store.bump_weak_spot_candidate(app_label)
+            # 늦은 밤은 하루 한 번 — 발사 성공 시 오늘 날짜 마크
+            if trigger_value == "늦은 밤":
+                self._store.last_late_night_fired = (
+                    datetime.datetime.now().date().isoformat()
+                )
             if not self._store.nag_policy_asked:
                 self._store.nag_policy_asked = True
         return {"ok": True, "action": "nag_sent"}

@@ -101,6 +101,7 @@ class Store:
             "daily_stats": {},
             "last_weekly_review": None,
             "last_overload_checkin": None,
+            "last_late_night_fired": None,  # YYYY-MM-DD — 하루 한 번 제약 영속화
             "implementation_intentions": [],
             "weak_spot_candidates": {},
         }
@@ -567,6 +568,18 @@ class Store:
     @last_weekly_review.setter
     def last_weekly_review(self, value: Optional[str]) -> None:
         self._set("last_weekly_review", value)
+
+    # ----------------------------------------------------- 늦은 밤 하루 1회
+    @property
+    def last_late_night_fired(self) -> Optional[str]:
+        """가장 최근 '늦은 밤' 트리거가 발사된 날짜 (YYYY-MM-DD).
+        위성이 재시작될 때 메모리 reset 되어 또 발사 시도해도 백엔드가 막도록
+        영속화. 클라우드 trigger_value 별 10분 쿨다운보다 강한 제약."""
+        return self._get("last_late_night_fired")
+
+    @last_late_night_fired.setter
+    def last_late_night_fired(self, value: Optional[str]) -> None:
+        self._set("last_late_night_fired", value)
 
     # ----------------------------------------------------- 과부하 자체 점검
     @property
