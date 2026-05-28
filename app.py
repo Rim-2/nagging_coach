@@ -27,7 +27,7 @@ import os
 import sys
 import threading
 import time
-from typing import Optional
+from typing import List, Optional
 
 from dotenv import load_dotenv
 
@@ -72,6 +72,7 @@ REMINDER_CHECK_INTERVAL = 120.0   # 일정 리마인더 점검 주기
 REMINDER_GRACE_SEC = 600.0        # 폴링 miss·재시작으로 늦은 알림 — N초 안이면 발사 (10분)
 ALARM_ONCE_MAX_RETRY = 3          # once 알람 발송 실패 시 최대 재시도 횟수
 RESET_CONFIRM_TTL = 60.0          # /reset 첫 명령 후 N초 안에 한 번 더 보내야 실행
+CHAT_DEBOUNCE_SEC = 1.5           # 사용자 chat 짧은 간격 우다다 → 묶어서 한 번에 답장
 
 
 _HELP_TEXT = (
@@ -250,6 +251,11 @@ class CoachApp:
         from collections import deque
         self._recent_triggers = deque(maxlen=20)
         self._recent_triggers_lock = threading.Lock()
+        # Chat debounce — 사용자가 짧은 간격에 여러 메시지 보내면 묶어서 한 번에
+        # LLM 호출 + 답장. 사람처럼 자연스럽게.
+        self._chat_buffer: List[str] = []
+        self._chat_buffer_lock = threading.Lock()
+        self._chat_debounce_timer: Optional[threading.Timer] = None
 
     @staticmethod
     def _init_calendar() -> Optional[CalendarClient]:
@@ -367,6 +373,12 @@ class CoachApp:
             self._pending_reset = None
             cmd = "/reset all" if kind == "hard" else "/reset"
             self._send(chat_id, f"({cmd} 취소 — 다른 메시지를 받았어)")
+
+        # 사진·명령 등 *별도 흐름*이 들어오기 전에 chat debounce 버퍼를 비운다.
+        # 우다다 채팅 후 곧이은 사진/명령이 chat 답변보다 먼저 가서 순서가
+        # 뒤집히지 않도록 명시적 flush.
+        if (photo or text.startswith("/")) and self._chat_buffer:
+            self._flush_chat_buffer(chat_id, immediate=True)
 
         if text.startswith("/help"):
             self._send(chat_id, _HELP_TEXT)
@@ -532,9 +544,44 @@ class CoachApp:
         return "\n".join(lines)
 
     def _handle_chat(self, chat_id: int, text: str) -> None:
+        """사용자 chat 메시지 도착 → 짧은 debounce 후 LLM 호출. 같은 debounce
+        창 안에 추가 메시지가 오면 버퍼에 누적되어 *한 번에* 묶여 답장된다."""
         self._last_user_msg = time.time()
+        with self._chat_buffer_lock:
+            self._chat_buffer.append(text)
+            # 기존 타이머 취소 후 새 타이머 — 우다다 도착 시 매번 만료 시각 갱신
+            if self._chat_debounce_timer is not None:
+                self._chat_debounce_timer.cancel()
+            timer = threading.Timer(
+                CHAT_DEBOUNCE_SEC,
+                self._flush_chat_buffer,
+                args=(chat_id,),
+            )
+            timer.daemon = True
+            self._chat_debounce_timer = timer
+            timer.start()
+
+    def _flush_chat_buffer(self, chat_id: int, *, immediate: bool = False) -> None:
+        """버퍼에 쌓인 사용자 메시지들을 합쳐 한 번에 LLM 호출 + 답장.
+        immediate=True 면 photo·command 등 *별도 흐름*이 들어오기 직전 호출돼서
+        타이머 만료를 기다리지 않고 즉시 비운다."""
+        with self._chat_buffer_lock:
+            if self._chat_debounce_timer is not None:
+                self._chat_debounce_timer.cancel()
+                self._chat_debounce_timer = None
+            if not self._chat_buffer:
+                return
+            messages = list(self._chat_buffer)
+            self._chat_buffer = []
+        if immediate:
+            print(f"[App] chat buffer 즉시 flush ({len(messages)}건)")
+        elif len(messages) > 1:
+            print(f"[App] chat buffer flush — {len(messages)}건 묶어서 처리")
+        # 여러 통이면 줄바꿈으로 합쳐 한 컨텍스트로 전달. LLM 은 한 사람이 연달아
+        # 보낸 메시지 묶음으로 자연스럽게 인식한다.
+        combined = "\n".join(messages) if len(messages) > 1 else messages[0]
         try:
-            reply = self._agent.chat(text)
+            reply = self._agent.chat(combined)
         except AIGenerationError as exc:
             self._note_ai_failure(chat_id, exc)
             return
