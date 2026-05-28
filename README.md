@@ -284,6 +284,7 @@ ENABLE_PC_TRACKER=false
 | `/help` | 사용법 안내 |
 | `/export` | 내 데이터 (목표·습관·일정·통계·설정) 한 번에 보기 |
 | `/reset` | 대화·목표·습관·일정 비우기 (`nag_policy` · 누적 통계는 유지) |
+| `/reset all` | 통계·설정·자기학습까지 전부 비우기 (처음 만난 상태로) |
 | 사진 전송 | 할 일 인증샷 |
 
 ---
@@ -333,12 +334,16 @@ ENABLE_PC_TRACKER=false
 - `analyze_my_patterns` 가 두 위성 활동을 같이 분석 — LLM 통합 분석 ✓
 - 주간 회고·인사이트가 통합 기준으로 집계 ✓
 
-**미구현 (Phase B/C)**:
-- 시간대별 생산성 매핑 (사용자 골든타임 자동 학습)
-- 위험 예측 (패턴 기반 선제 알림)
-- **실시간 복합 트리거** — "PC 업무앱 켜놓고 폰 SNS 30분" 같이 두 위성 신호를 *시간축에서 결합* 한 룰 (현재는 각 위성이 독립 발사)
-- 행동 시퀀스 학습 (도파민 trail 자동 추출)
-- **생산성 앱 사용 중 잔소리 억제** — 현재 활동이 생산성 카테고리(IDE·문서·디자인 툴 등)면 트리거 가드. 약점 앱 / 산만 신호와 충돌하지 않게 우선순위 룰 필요.
+**구현 완료 (Phase B/C 일괄)**:
+- 시간대별 생산성 매핑 — `hourly_breakdown` 으로 골든타임·위험 시간대 도출, `get_weekly_insight`·`analyze_my_patterns` 노출
+- 위험 예측 선제 알림 — 위험 시간대 *직전* 1일 1회 발사 (gentle 톤일 땐 스킵)
+- 실시간 복합 트리거 — PC + 폰 결합 룰 (`회피 패턴`), `_recent_triggers` 메모리 기반
+- 도파민 trail 학습 — 위성이 트리거 직전 sanitized 시퀀스 동봉, 백엔드 N-gram 카운트, `analyze_my_patterns` 가 if-then plan 권유에 활용
+- 생산성 앱 가드 — `PRODUCTIVITY_KEYWORDS` 매칭 시 도파민·과몰입·도파민 스크롤 트리거 억제 (약점·산만·과로·늦은 밤은 그대로)
+- 위성↔백엔드 weak_spots 동기화 — `GET /weak_spots` 엔드포인트, 위성 5분 간격 fetch + 캐싱
+- EXTRACT 모델 분리 — `GEMINI_EXTRACT_MODEL` 환경변수, Lite 등 cheap 모델 사용 시 비용 절감
+- Gemini API retry — 일시 503/504/timeout 에 1s→2s backoff, 영구 오류는 즉시 fail-fast
+- `/reset all` 분기 — 통계·설정·자기학습까지 비우는 옵션
 
 백엔드는 이미 `POST /trigger` 한 엔드포인트로 모든 클라이언트를 받는 구조라, 새 디바이스 (스마트워치 등) 추가도 같은 패턴으로 가능.
 

@@ -36,6 +36,9 @@ from store import Store
 load_dotenv()
 
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+# EXTRACT 는 구조화 JSON 추출만 — 창의성 X. 더 가벼운 모델로 분리 시 비용 절감.
+# 미설정 시 메인 모델로 fall-back.
+EXTRACT_MODEL = os.getenv("GEMINI_EXTRACT_MODEL", "") or DEFAULT_MODEL
 API_KEY_ENV = "GEMINI_API_KEY"
 RETRY_ATTEMPTS = 2
 MAX_TOOL_ITERS = 5  # 에이전트 루프에서 도구 호출 연쇄 최대 횟수
@@ -306,6 +309,11 @@ class CoachAgent:
 
         self._lock = threading.Lock()
         self._model_name = model_name
+        # EXTRACT 전용 모델 — 환경변수로 분리 시 cheap 모델 사용 가능. 미설정·
+        # 미발견 시 메인 모델로 자동 fallback.
+        self._extract_model_name = EXTRACT_MODEL
+        if self._extract_model_name != self._model_name:
+            print(f"[CoachAgent] EXTRACT 별도 모델: {self._extract_model_name}")
         self._calendar = calendar
         self._tools = build_tools(
             calendar, store,
@@ -480,10 +488,14 @@ class CoachAgent:
                 model=self._model_name, config=self._chat_config()
             )
 
-    def reset(self) -> None:
-        """대화 기록·목표를 비우고 세션을 새로 시작한다 (/reset)."""
+    def reset(self, hard: bool = False) -> None:
+        """대화 기록·목표를 비우고 세션을 새로 시작한다 (/reset).
+        hard=True 면 통계·설정·자기학습까지 전부 (/reset all)."""
         with self._lock:
-            self._store.clear_conversation()
+            if hard:
+                self._store.hard_reset()
+            else:
+                self._store.clear_conversation()
             self._chat = self._new_chat()
 
     # ===================================================== 대화 처리
@@ -537,6 +549,22 @@ class CoachAgent:
                 f"[자동 트리거] 곧 '{event_summary}' 일정이 {minutes_left}분 "
                 f"뒤에 시작해. 사용자가 안 까먹게 코치로서 한마디 해 — "
                 f"친구처럼 가볍게, 한두 문장으로."
+            )
+            return self._turn(prompt)
+
+    def risk_predict(self, target_hour: int, top_trigger_label: str, fire_count: int) -> str:
+        """위험 예측 선제 알림. 과거 패턴상 target_hour 시간대에 자주 잡혔다는
+        걸 사용자에게 *직전*에 살짝 짚어준다. 다그치지 않고 자기인식을 거든다.
+        target_hour: 위험 시간대 (0~23). top_trigger_label: 그 시간대에 가장 잦은
+        트리거 이름. fire_count: 최근 14일간 발사 누적 횟수."""
+        with self._lock:
+            prompt = (
+                "[자동 트리거] 시간대 패턴 분석 결과, 사용자는 최근 2주 동안 "
+                f"{target_hour}시 무렵에 '{top_trigger_label}' 트리거가 "
+                f"{fire_count}번 잡혔어. 곧 그 시간대야. 다그치지 말고 자기인식을 "
+                "돕는 톤으로, 한두 문장만. 예시: '곧 그 시간이네 — 어제 같은 시간에 "
+                "유튜브 빠졌었어. 지금 뭘 하고 있어?' 같은 식. 패턴을 객관적으로 "
+                "짚고, 사용자가 선택하게 둬. 라벨링 금지 ('습관이 약해' 같은 X)."
             )
             return self._turn(prompt)
 
@@ -667,8 +695,11 @@ class CoachAgent:
             types.Part(text=prompt),
         ]
         try:
-            response = self._client.models.generate_content(
-                model=self._model_name, contents=contents, config=config
+            response = self._call_genai(
+                model=self._model_name,
+                contents=contents,
+                config=config,
+                label="사진 판독",
             )
             text = self._safe_text(response)
         except Exception as exc:
@@ -748,6 +779,37 @@ class CoachAgent:
             pass
         return calls
 
+    # ============================================= Gemini API 호출 wrapper
+    # 일시적 503/504/timeout 에 짧은 backoff retry. 영구 오류(auth, quota)는
+    # 즉시 raise — 시도해도 의미 없으므로 호출자가 빠르게 fail-fast.
+    _GENAI_RETRY_BACKOFF = (1.0, 2.0)  # 시도 #2 전 1초, #3 전 2초
+
+    def _call_genai(self, *, model: str, contents, config, label: str = "generate"):
+        last_err: Optional[Exception] = None
+        attempts = 1 + len(self._GENAI_RETRY_BACKOFF)
+        for i in range(attempts):
+            try:
+                return self._client.models.generate_content(
+                    model=model, contents=contents, config=config
+                )
+            except Exception as exc:
+                last_err = exc
+                msg = str(exc).lower()
+                # 영구 오류는 retry 무의미 — 즉시 raise
+                if any(
+                    k in msg
+                    for k in ("api key", "permission", "unauthorized", "quota")
+                ):
+                    raise
+                if i < attempts - 1:
+                    delay = self._GENAI_RETRY_BACKOFF[i]
+                    print(
+                        f"[CoachAgent] {label} 일시 실패 ({exc}) — "
+                        f"{delay:.0f}s 후 재시도 ({i+2}/{attempts})"
+                    )
+                    time.sleep(delay)
+        raise last_err  # type: ignore[misc]
+
     # ================================================= 상태 추출 (지각)
     def _extract_state(self, last_input: str, coach_reply: str) -> None:
         """대화 turn 끝에 호출. 방금 오간 내용에서 목표·진척·프로필 변화를
@@ -767,8 +829,11 @@ class CoachAgent:
             response_mime_type="application/json",
         )
         try:
-            response = self._client.models.generate_content(
-                model=self._model_name, contents=prompt, config=config
+            response = self._call_genai(
+                model=self._extract_model_name,
+                contents=prompt,
+                config=config,
+                label="상태 추출",
             )
             data = json.loads(self._safe_text(response) or "{}")
         except Exception as exc:
@@ -946,6 +1011,25 @@ class CoachAgent:
         if weak:
             ctx += f"\n등록된 약점: {', '.join(weak)}"
 
+        # 시간대별 매핑 — 골든타임 / 위험 시간대를 컨텍스트에 포함하면 LLM 이
+        # 시간 관점 패턴을 짚을 수 있다. 데이터 적으면 자동 생략.
+        hb = self._store.hourly_breakdown(days=min(days, 21))
+        if hb.get("total_days_with_data", 0) >= 3:
+            if hb["golden_hours"]:
+                gh = ", ".join(f"{h}시(완료 {c}회)" for h, c in hb["golden_hours"])
+                ctx += f"\n골든타임 (완료가 잦은 시간대): {gh}"
+            if hb["risk_hours"]:
+                rh = ", ".join(f"{h}시(트리거 {c}회)" for h, c in hb["risk_hours"])
+                ctx += f"\n위험 시간대 (트리거가 잦은 시간대): {rh}"
+
+        # 도파민 trail — 자주 등장하는 '딴짓 직전 행동 시퀀스'. if-then plan
+        # 권유 후보로 LLM 이 활용. min_count=2 로 노이즈 차단.
+        trails = self._store.top_dopamine_trails(n=3, min_count=2)
+        if trails:
+            ctx += "\n도파민 trail (딴짓 직전 자주 나오는 행동 흐름): " + " / ".join(
+                f"[{' → '.join(seq)}] ×{c}" for seq, c in trails
+            )
+
         prompt = (
             ctx + "\n\n"
             "위 데이터를 보고 의미 있는 패턴 3~5개를 뽑아라. 예시 방향:\n"
@@ -953,6 +1037,7 @@ class CoachAgent:
             "- 자주 잡히는 트리거 종류와 그 직전 활동\n"
             "- mood 가 ↑ / ↓ 되는 활동의 상관관계\n"
             "- 등록된 약점 외에 새로 의심되는 행동\n"
+            "- 도파민 trail 이 있으면 그 흐름의 *첫 단계* 에서 끊는 if-then plan 제안\n"
             "각 패턴은 데이터로 뒷받침 가능해야 한다 — 추측 금지. "
             "친구한테 이야기 들려주듯 한국어 반말, 핵심만. "
             "맨 앞에 '최근 N일 패턴' 같은 라벨 X — 바로 본문 시작."
@@ -1006,6 +1091,8 @@ class CoachAgent:
         max_output_tokens: int,
         label: str,
     ) -> str:
+        """focused 호출용 헬퍼 — 내부적으로 _call_genai 가 일시 오류 backoff retry.
+        빈 응답은 1회 추가 시도 (안전 차단 등 케이스)."""
         config = types.GenerateContentConfig(
             system_instruction=system_instruction,
             temperature=temperature,
@@ -1014,8 +1101,11 @@ class CoachAgent:
         last_error: Optional[str] = None
         for attempt in range(1, RETRY_ATTEMPTS + 1):
             try:
-                response = self._client.models.generate_content(
-                    model=self._model_name, contents=user_msg, config=config
+                response = self._call_genai(
+                    model=self._model_name,
+                    contents=user_msg,
+                    config=config,
+                    label=label,
                 )
                 text = self._safe_text(response)
                 if text:
@@ -1024,8 +1114,8 @@ class CoachAgent:
             except Exception as exc:
                 last_error = str(exc)
             print(
-                f"[CoachAgent] {label} 실패 "
-                f"(시도 {attempt}/{RETRY_ATTEMPTS}): {last_error}"
+                f"[CoachAgent] {label} 빈 응답·실패 "
+                f"({attempt}/{RETRY_ATTEMPTS}): {last_error}"
             )
         raise AIGenerationError(f"{label} 생성 실패: {last_error}")
 

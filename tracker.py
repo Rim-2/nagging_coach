@@ -51,6 +51,25 @@ WORK_KEYWORDS = (
     "word", "excel", "powerpoint", "code", "notion",
     "visual studio", "intellij", "pycharm", "hwp", "한글", "google docs",
 )
+# 생산성 앱 — 활성 창이 여기 해당하면 약점·산만 외 트리거는 *억제*. 사용자가
+# 일하고 있는 상황에서 잔소리가 끼어드는 걸 막는다. WORK_KEYWORDS 보다 넓고
+# 도메인 별 도구를 포함.
+PRODUCTIVITY_KEYWORDS = (
+    # IDE·개발 도구
+    "visual studio", "vscode", "intellij", "pycharm", "webstorm", "rider",
+    "android studio", "eclipse", "xcode", "sublime text", "neovim",
+    "terminal", "powershell", "cmd.exe", "wsl",
+    # 문서·오피스
+    "word", "excel", "powerpoint", "hwp", "한글", "notion", "obsidian",
+    "google docs", "google sheets", "google slides", "onenote", "evernote",
+    "confluence", "logseq",
+    # 디자인·미디어 제작
+    "figma", "sketch", "adobe", "photoshop", "illustrator", "premiere",
+    "after effects", "blender", "davinci",
+    # 학습·업무 협업
+    "zoom", "teams", "slack", "asana", "jira", "trello", "linear",
+    "github", "gitlab", "stack overflow", "arxiv", "wikipedia",
+)
 ADDICTIVE_KEYWORDS = (
     "league of legends", "kakaotalk", "카카오톡",
     "discord", "steam", "battle.net", "valorant", "overwatch",
@@ -354,6 +373,18 @@ class Tracker:
             freq[label] = freq.get(label, 0) + 1
         return freq
 
+    def get_recent_label_sequence(self, max_items: int = 8) -> List[str]:
+        """가장 최근 sanitized 라벨을 시간순(오래된 → 최근)으로 반환. 같은 라벨이
+        연속되면 *압축*해서 한 번만 — 도파민 trail (직전 행동 시퀀스) 학습용."""
+        out: List[str] = []
+        for _ts, label in self._recent_sanitized:
+            if not label:
+                continue
+            if out and out[-1] == label:
+                continue
+            out.append(label)
+        return out[-max_items:]
+
     # =============================================== input listeners
     def _start_input_listeners(self) -> None:
         self._kb_listener = keyboard.Listener(on_press=self._on_input_event)
@@ -458,18 +489,32 @@ class Tracker:
             return ""
 
     # ====================================================== triggers
+    @staticmethod
+    def _is_productive_context(title_lower: str) -> bool:
+        """현재 활성 창이 생산성 앱(IDE·문서·디자인 툴 등)이면 True.
+        룰: 약점 앱·산만함·늦은 밤 외 트리거는 이 상태에서 발사 억제."""
+        return any(k in title_lower for k in PRODUCTIVITY_KEYWORDS)
+
     def _evaluate(self, snap: Snapshot) -> Optional[TriggerType]:
         title = snap.active_window.lower()
+        productive_context = self._is_productive_context(title)
 
         # Trigger 5: 늦은 밤 — 새벽 시간대 사용 (하룻밤에 한 번만)
+        # 생산성 가드 *제외* — 야간 작업도 건강 이슈로 잔소리.
         now_dt = datetime.datetime.now()
         if self.LATE_NIGHT_START_HOUR <= now_dt.hour < self.LATE_NIGHT_END_HOUR:
             if self._late_night_fired_on != now_dt.date():
                 self._late_night_fired_on = now_dt.date()
                 return TriggerType.LATE_NIGHT
 
+        # 이하 도파민·과몰입·과로 트리거는 생산성 컨텍스트에서 발사 억제.
+        # 사용자가 *진짜 일하는 중*일 때 잔소리가 끼어드는 걸 막는다.
+        # (산만함·약점 앱은 아래 별도 분기에서 따로 처리)
+
         # Trigger 1: 도파민 좀비 — 엔터테인먼트 + 10분 무입력
-        if (
+        if productive_context:
+            pass  # 생산성 앱이면 도파민 좀비 트리거 스킵
+        elif (
             any(k in title for k in ENTERTAINMENT_KEYWORDS)
             and snap.idle_time > self.DOPAMINE_IDLE_SEC
         ):
@@ -488,7 +533,10 @@ class Tracker:
             return TriggerType.FAKE_WORKING
 
         # Trigger 4: 과몰입 딴짓 — 중독성 앱 + 고빈도 입력 30분 지속
-        if any(k in title for k in ADDICTIVE_KEYWORDS):
+        # 생산성 컨텍스트면 스킵 — 사용자가 일하는 중에는 발사하지 않는다.
+        if productive_context:
+            self._immersion_started = None
+        elif any(k in title for k in ADDICTIVE_KEYWORDS):
             with self._input.lock:
                 events_per_min = len(self._input.recent_events)
             if events_per_min >= self.OVER_IMMERSION_INPUT_THRESHOLD:
@@ -503,7 +551,10 @@ class Tracker:
             self._immersion_started = None
 
         # Trigger 6: 능동적 도파민 스크롤 — 엔터테인먼트 + 활발한 사용 15분
-        if (
+        # 생산성 컨텍스트면 스킵.
+        if productive_context:
+            self._scroll_started = None
+        elif (
             any(k in title for k in ENTERTAINMENT_KEYWORDS)
             and snap.idle_time < self.ACTIVE_SCROLL_MAX_IDLE
         ):

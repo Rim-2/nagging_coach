@@ -40,6 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
 URL = os.getenv("NAGGING_COACH_URL", "").rstrip("/")
 SECRET = os.getenv("TRIGGER_SECRET", "")
 POST_TIMEOUT = 20.0
+WEAK_SPOTS_FETCH_INTERVAL = 300.0   # 5분마다 백엔드의 학습된 약점 키워드 동기화
 
 
 class Satellite:
@@ -54,18 +55,46 @@ class Satellite:
         self._url = url
         self._secret = secret
         self._session = requests.Session()
+        # 백엔드에서 fetch 한 약점 키워드 캐시 — 5분마다 갱신.
+        self._weak_spots: list = []
+        self._weak_spots_last_fetch: float = 0.0
         self._tracker = Tracker(
             on_trigger=self._on_trigger,
-            # 약점 키워드 동기화는 추후 GET 엔드포인트로 — 일단 비움.
-            get_weak_spots=lambda: [],
+            # 백엔드의 학습된 약점 키워드를 주기적으로 fetch 해서 매칭에 사용.
+            get_weak_spots=lambda: list(self._weak_spots),
         )
+
+    def _fetch_weak_spots(self) -> None:
+        """백엔드 /weak_spots 에서 사용자 약점 키워드를 받아 캐시에 저장.
+        실패해도 기존 캐시 유지 — 일시 장애로 매칭이 깨지지 않도록."""
+        try:
+            resp = self._session.get(
+                f"{self._url}/weak_spots",
+                headers={"Authorization": f"Bearer {self._secret}"},
+                timeout=10.0,
+            )
+            if resp.status_code != 200:
+                print(f"[Satellite] /weak_spots fetch 실패: HTTP {resp.status_code}")
+                return
+            data = resp.json()
+            items = data.get("weak_spots") or []
+            if items != self._weak_spots:
+                self._weak_spots = list(items)
+                print(f"[Satellite] 약점 키워드 갱신: {self._weak_spots}")
+            self._weak_spots_last_fetch = time.time()
+        except Exception as exc:
+            print(f"[Satellite] /weak_spots fetch 오류: {exc}")
 
     def run(self) -> None:
         self._tracker.start()
         print(f"[Satellite] PC 감시 시작 — 트리거 발사 → {self._url}/trigger")
+        # 시작 즉시 한 번 fetch — 첫 매칭부터 백엔드 학습이 반영되도록.
+        self._fetch_weak_spots()
         try:
             while True:
                 time.sleep(60.0)
+                if time.time() - self._weak_spots_last_fetch >= WEAK_SPOTS_FETCH_INTERVAL:
+                    self._fetch_weak_spots()
         except KeyboardInterrupt:
             print("\n[Satellite] 종료 중…")
         finally:
@@ -77,6 +106,7 @@ class Satellite:
         잔소리가 연발되는 건 자동으로 막힌다."""
         body = {
             "trigger": trigger.value,
+            "device": "pc",
             "snapshot": {
                 "active_window": snap.active_window,
                 "idle_time": snap.idle_time,
@@ -89,6 +119,14 @@ class Satellite:
                 body["window_freq"] = self._tracker.get_recent_window_freq()
             except Exception as exc:
                 print(f"[Satellite] window_freq 추출 실패: {exc}")
+        # 도파민 trail 학습용 — 트리거 직전 sanitized 라벨 시퀀스. 백엔드가 자주
+        # 등장하는 prefix 를 누적해 사용자에게 if-then plan 으로 권유한다.
+        try:
+            seq = self._tracker.get_recent_label_sequence(max_items=8)
+            if seq:
+                body["trail"] = seq
+        except Exception as exc:
+            print(f"[Satellite] trail 추출 실패: {exc}")
 
         try:
             resp = self._session.post(

@@ -921,6 +921,22 @@ def _get_weekly_insight(store) -> str:
         if bits:
             corr_line = " 활동-기분 상관: " + " · ".join(bits) + "."
 
+    # 시간대 매핑 — 골든타임 / 위험 시간대 (최근 14일 기준)
+    hour_line = ""
+    hb = store.hourly_breakdown(days=14)
+    if hb.get("total_days_with_data", 0) >= 3:
+        parts = []
+        if hb["golden_hours"]:
+            parts.append(
+                "골든타임 " + ", ".join(f"{h}시" for h, _ in hb["golden_hours"])
+            )
+        if hb["risk_hours"]:
+            parts.append(
+                "위험 시간대 " + ", ".join(f"{h}시" for h, _ in hb["risk_hours"])
+            )
+        if parts:
+            hour_line = " 시간대 패턴: " + " · ".join(parts) + "."
+
     return (
         f"최근 7일 — {rate_line}; "
         f"목표 완료 {rec['goals_completed']}회 "
@@ -932,6 +948,7 @@ def _get_weekly_insight(store) -> str:
         f"가장 자주 잡힌 패턴: '{rec['top_trigger'] or '-'}'."
         f"{mood_line}"
         f"{corr_line}"
+        f"{hour_line}"
     )
 
 

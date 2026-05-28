@@ -88,6 +88,7 @@ _HELP_TEXT = (
     "/help — 이 도움말\n"
     "/export — 내 데이터 (목표·습관·일정·통계) 한 번에 보기\n"
     "/reset — 대화·목표·습관·일정 다 비우기 (설정·통계는 유지)\n"
+    "/reset all — 통계·설정·약점 학습까지 전부 비우기 (처음 만난 상태로)\n"
 )
 ALARM_CHECK_INTERVAL = 30.0       # 예약 알람 점검 주기
 WEEKLY_REVIEW_HOUR = 21           # 매주 일요일 N시에 주간 회고 ritual
@@ -176,6 +177,23 @@ class _TriggerHTTPHandler(http.server.BaseHTTPRequestHandler):
         if self.path in ("/", "/health"):
             self._respond(200, {"ok": True, "service": "nagging_coach"})
             return
+        # 위성이 백엔드의 학습된 약점 키워드를 주기적으로 fetch — Bearer 인증 필수
+        # (헬스체크는 인증 없이, 데이터는 인증 후).
+        if self.path == "/weak_spots":
+            if not self.trigger_secret:
+                self._respond(503, {"ok": False, "error": "secret not configured"})
+                return
+            if self.headers.get("Authorization", "") != f"Bearer {self.trigger_secret}":
+                self._respond(401, {"ok": False, "error": "unauthorized"})
+                return
+            try:
+                items = list(self.coach_app._store.weak_spots)
+            except Exception as exc:
+                print(f"[App] /weak_spots 조회 오류: {exc}")
+                self._respond(500, {"ok": False, "error": "internal"})
+                return
+            self._respond(200, {"ok": True, "weak_spots": items})
+            return
         self._respond(404, {"ok": False, "error": "not found"})
 
     def log_message(self, format, *args) -> None:  # noqa: A002
@@ -223,6 +241,11 @@ class CoachApp:
         self._ignored_nags = 0               # 연속으로 무시당한 잔소리 횟수
         self._remote_cooldowns: dict[str, float] = {}  # trigger_value → 다음 발동 가능 시각
         self._remote_cooldown_lock = threading.Lock()
+        # 최근 트리거 이력 (복합 트리거 룰 평가용). 메모리 deque, 봇 재시작 시 리셋.
+        # 항목: {"device": "pc"|"phone", "trigger": str, "at": float}
+        from collections import deque
+        self._recent_triggers = deque(maxlen=20)
+        self._recent_triggers_lock = threading.Lock()
 
     @staticmethod
     def _init_calendar() -> Optional[CalendarClient]:
@@ -286,6 +309,9 @@ class CoachApp:
         threading.Thread(
             target=self._retry_loop, name="Retry", daemon=True
         ).start()
+        threading.Thread(
+            target=self._risk_predict_loop, name="RiskPredict", daemon=True
+        ).start()
         self._start_http_server()
 
         print("[App] 실행 중. Ctrl+C 로 종료.")
@@ -339,10 +365,18 @@ class CoachApp:
             return
 
         if text.startswith("/reset"):
-            self._agent.reset()
-            self._send(
-                chat_id, "기억 싹 비웠어. 자, 다시 시작하자 — 오늘 뭐 할 거야?"
-            )
+            # `/reset all` 은 통계·설정·자기학습까지 전부 비움 — 위험 작업이라
+            # 명시 인자 필수. `/reset` 만 쓰면 기존 동작 (대화·목표·습관만).
+            hard = text.strip().lower() in ("/reset all", "/reset hard", "/resetall")
+            self._agent.reset(hard=hard)
+            if hard:
+                msg = (
+                    "전부 초기화했어 — 통계·설정·약점 학습까지 다 비웠어. "
+                    "처음 만난 것처럼 시작하자."
+                )
+            else:
+                msg = "기억 싹 비웠어. 자, 다시 시작하자 — 오늘 뭐 할 거야?"
+            self._send(chat_id, msg)
             return
 
         if photo:
@@ -615,6 +649,12 @@ class CoachApp:
             body = (
                 f"사용자가 평소 자주 빠진다고 했던 '{win}'에 다시 들어왔어."
             )
+        elif trigger_value == "회피 패턴":
+            body = (
+                f"사용자가 PC에서 업무앱을 켜둔 채 폰으로 SNS·메신저로 넘어가서 한참 머무는, "
+                f"혹은 그 역방향의 회피 흐름이 잡혔어. 지금 보고 있는 창: '{win}'. "
+                "다그치지 말고 패턴을 객관적으로 짚어 주고, 작은 한 걸음을 권해."
+            )
         else:  # "과몰입 딴짓" 또는 알 수 없는 신규 트리거
             mins = session_min if session_min and session_min > 0 else 30
             body = (
@@ -688,6 +728,45 @@ class CoachApp:
         print(f"[App] 전송 실패 → retry 큐 적재 (kind={kind}, id={msg_id[:8]})")
         return False
 
+    # ============================================== 복합 트리거 (PC + 폰 결합)
+    # 두 위성 신호를 시간축에서 결합해 단일 위성 룰로는 못 잡는 패턴 감지.
+    _COMPOUND_WINDOW_SEC = 10 * 60.0   # 두 트리거가 이 시간 내에 있어야 결합 평가
+    # 결합 룰 — (이전 device, 이전 트리거, 현재 device, 현재 트리거) → 복합 라벨
+    _COMPOUND_RULES = {
+        # PC에서 일하는 척(idle/과로) → 곧이어 폰에서 도파민 = 회피
+        ("pc", "가짜 일하기", "phone", "능동적 도파민 스크롤"): "회피 패턴",
+        ("pc", "가짜 일하기", "phone", "과몰입 딴짓"): "회피 패턴",
+        ("pc", "휴식 없는 과로", "phone", "능동적 도파민 스크롤"): "회피 패턴",
+        ("pc", "휴식 없는 과로", "phone", "과몰입 딴짓"): "회피 패턴",
+        # 반대 방향: 폰에서 SNS 보다가 PC로 가서 일하는 척 = 또 다른 회피
+        ("phone", "능동적 도파민 스크롤", "pc", "가짜 일하기"): "회피 패턴",
+        ("phone", "과몰입 딴짓", "pc", "가짜 일하기"): "회피 패턴",
+    }
+
+    def _evaluate_compound_trigger(
+        self, device: str, trigger_value: str
+    ) -> Optional[str]:
+        """현재 도착한 트리거와 _recent_triggers 의 *다른 device* 이력을 비교해
+        복합 룰이 매칭되면 승격 라벨을 돌려준다. 매칭 없으면 None."""
+        now = time.time()
+        with self._recent_triggers_lock:
+            for prev in reversed(self._recent_triggers):
+                if now - prev["at"] > self._COMPOUND_WINDOW_SEC:
+                    break    # 시간순 deque — 더 오래된 건 더 이상 의미 X
+                if prev["device"] == device:
+                    continue  # 같은 device 끼리는 결합 룰 대상 아님
+                key = (prev["device"], prev["trigger"], device, trigger_value)
+                label = self._COMPOUND_RULES.get(key)
+                if label:
+                    return label
+        return None
+
+    def _record_recent_trigger(self, device: str, trigger_value: str) -> None:
+        with self._recent_triggers_lock:
+            self._recent_triggers.append(
+                {"device": device, "trigger": trigger_value, "at": time.time()}
+            )
+
     def _policy_recovery_note(self) -> str:
         """일시 톤다운 (컨디션 신호로 적용된 24h gentle) 이 막 만료되었을 때,
         다음 잔소리에 자연스러운 복귀 코멘트를 끼우게 가이드. 한 번만 발동."""
@@ -740,8 +819,36 @@ class CoachApp:
         trigger_value = str(body.get("trigger", "")).strip()
         snap = body.get("snapshot") or {}
         freq = body.get("window_freq")
+        device = str(body.get("device", "")).strip().lower() or "pc"
+        trail = body.get("trail")
         if not trigger_value:
             return {"ok": False, "action": "skipped", "reason": "missing_trigger"}
+
+        # 도파민 trail 학습 — 딴짓 카테고리 트리거 직전 라벨 시퀀스 누적.
+        # 약점 앱·도파민 좀비·능동 도파민 스크롤·과몰입 딴짓에 한정. 의미 없는
+        # 카테고리(늦은 밤·과로 등)에선 학습 안 함.
+        _TRAIL_LEARN_TRIGGERS = {
+            "개인 약점 앱", "도파민 좀비", "능동적 도파민 스크롤", "과몰입 딴짓",
+        }
+        if (
+            isinstance(trail, list)
+            and trigger_value in _TRAIL_LEARN_TRIGGERS
+        ):
+            try:
+                self._store.bump_dopamine_trail([str(x) for x in trail])
+            except Exception as exc:
+                print(f"[App] trail 학습 실패: {exc}")
+
+        # 복합 룰 평가 — 다른 device 의 최근 트리거와 결합 가능하면 라벨 승격.
+        # 승격 후엔 *복합 라벨* 로 쿨다운·잔소리 처리. 원본 트리거는 이력에 기록.
+        compound_label = self._evaluate_compound_trigger(device, trigger_value)
+        self._record_recent_trigger(device, trigger_value)
+        if compound_label and compound_label != trigger_value:
+            print(
+                f"[App] (원격) 복합 트리거 승격: {device}/{trigger_value} → "
+                f"{compound_label}"
+            )
+            trigger_value = compound_label
 
         # 같은 트리거 종류는 N분 쿨다운 — 위성 60초 쿨다운으론 idle/dwell 기반
         # 트리거가 연발되는 걸 못 막아서, 여기서 권위 있게 한 번 더 걸러낸다.
@@ -1159,6 +1266,57 @@ class CoachApp:
             target=server.serve_forever, name="TriggerHTTP", daemon=True
         ).start()
         print(f"[App] 원격 트리거 HTTP 서버 시작 — 포트 {port}, POST /trigger")
+
+    # ====================================================== 위험 시간대 예측
+    # 시간대 매핑 결과를 바탕으로 다음 위험 시간 *직전*에 1일 1회 선제 알림.
+    _RISK_PREDICT_CHECK_INTERVAL = 300.0      # 5분 폴링
+    _RISK_PREDICT_LEAD_MIN = 15               # 위험 시간 N분 전에 발사
+    _RISK_PREDICT_MIN_FIRES = 3               # 최근 14일간 최소 N회 이상이어야 위험으로 인정
+
+    def _risk_predict_loop(self) -> None:
+        """다음 시각이 시간대 매핑 상 위험 시간대면 직전에 선제 알림. 부담 완화
+        위해 1일 1회 + 최소 임계치 + 활성 톤이 gentle 이 아닐 때만."""
+        while not self._stop.wait(self._RISK_PREDICT_CHECK_INTERVAL):
+            chat_id = self._store.chat_id
+            if chat_id is None:
+                continue
+            # gentle 톤 (base 또는 일시) 일 땐 선제 알림이 압박이 될 수 있어 스킵
+            if self._store.active_nag_policy == "gentle":
+                continue
+            if self._store.risk_predict_already_fired_today():
+                continue
+            now = datetime.datetime.now()
+            # 다음 시각 = 현재 시각 + 1시간 (lead 분 단위로 정밀)
+            next_hour = (now.hour + 1) % 24
+            minutes_to_next = 60 - now.minute
+            if minutes_to_next > self._RISK_PREDICT_LEAD_MIN:
+                continue
+            try:
+                hb = self._store.hourly_breakdown(days=14)
+            except Exception as exc:
+                print(f"[App] 위험 예측 hourly_breakdown 실패: {exc}")
+                continue
+            if hb.get("total_days_with_data", 0) < 3:
+                continue   # 데이터 부족
+            risk_hours = hb.get("risk_hours") or []
+            target = None
+            for h, c in risk_hours:
+                if int(h) == int(next_hour) and int(c) >= self._RISK_PREDICT_MIN_FIRES:
+                    target = (int(h), int(c))
+                    break
+            if target is None:
+                continue
+            # 가장 많이 잡힌 트리거 라벨 — weekly_summary 의 top_trigger 사용
+            weekly = self._store.weekly_summary(days=14)
+            top_label = (weekly.get("recent") or {}).get("top_trigger") or "딴짓"
+            try:
+                reply = self._agent.risk_predict(target[0], top_label, target[1])
+            except AIGenerationError as exc:
+                print(f"[App] 위험 예측 메시지 생성 실패: {exc}")
+                continue
+            print(f"[App] 위험 예측 발송: {target[0]}시 ({target[1]}회 누적)")
+            self._send_or_enqueue(chat_id, reply, kind="risk_predict")
+            self._store.mark_risk_predict_fired(target[0])
 
     # ====================================================== 주간 회고
     def _weekly_review_loop(self) -> None:

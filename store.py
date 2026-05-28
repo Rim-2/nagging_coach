@@ -108,8 +108,12 @@ class Store:
             "last_weekly_review": None,
             "last_overload_checkin": None,
             "last_late_night_fired": None,  # YYYY-MM-DD — 하루 한 번 제약 영속화
+            "last_risk_predict": None,      # {"date": YYYY-MM-DD, "hour": int} — 1일 1회 가드
             "implementation_intentions": [],
             "weak_spot_candidates": {},
+            # 도파민 trail 학습 — 딴짓 트리거 직전 sanitized 라벨 시퀀스 N-gram
+            # 카운터. 키: "label1|label2|label3" (길이 3 trail). 값: int 카운트.
+            "dopamine_trails": {},
             # 텔레그램 전송 실패 시 영구 retry 큐. 잔소리·자동 메시지 전용.
             # 항목: {id, kind, chat_id, text, side_effects, attempts,
             #        next_attempt_at, first_attempt_at, created_at}
@@ -257,6 +261,10 @@ class Store:
             if completed:
                 bucket = self._today_bucket()
                 bucket["goals_completed"] = bucket.get("goals_completed", 0) + 1
+                hk = self._hour_key()
+                bucket["hourly_goals_completed"][hk] = (
+                    bucket["hourly_goals_completed"].get(hk, 0) + 1
+                )
                 self._data["today_goals"] = [
                     g for g in self._data["today_goals"] if g is not target
                 ]
@@ -279,6 +287,10 @@ class Store:
             if changed:
                 bucket = self._today_bucket()
                 bucket["goals_completed"] = bucket.get("goals_completed", 0) + 1
+                hk = self._hour_key()
+                bucket["hourly_goals_completed"][hk] = (
+                    bucket["hourly_goals_completed"].get(hk, 0) + 1
+                )
                 self._persist()
             return changed
 
@@ -365,6 +377,39 @@ class Store:
             ]
             items.sort(key=lambda kv: -kv[1])
             return items[:n]
+
+    # ----------------------------------------------------- 도파민 trail 학습
+    TRAIL_LEN = 3  # 트리거 직전 N개 라벨을 1개 trail 키로 묶는다
+
+    def bump_dopamine_trail(self, sequence: List[str]) -> None:
+        """딴짓 트리거 직전 라벨 시퀀스에서 길이 TRAIL_LEN prefix·suffix 를 추출해
+        카운터에 누적. 마지막 N개가 가장 의미 있음 (트리거 직전 흐름)."""
+        seq = [str(s).strip() for s in sequence if str(s).strip()]
+        if len(seq) < self.TRAIL_LEN:
+            return
+        tail = seq[-self.TRAIL_LEN:]
+        key = "|".join(tail)
+        with self._lock:
+            trails = self._data.setdefault("dopamine_trails", {})
+            trails[key] = trails.get(key, 0) + 1
+            # 비대 방지 — 200개 넘으면 빈도 낮은 절반 정리
+            if len(trails) > 200:
+                ranked = sorted(trails.items(), key=lambda kv: kv[1])
+                for k, _ in ranked[: len(trails) // 2]:
+                    trails.pop(k, None)
+            self._persist()
+
+    def top_dopamine_trails(self, n: int = 5, min_count: int = 2) -> List[tuple]:
+        """가장 자주 등장한 trail. min_count 미만은 노이즈로 보고 제외.
+        반환: [(["a","b","c"], count), ...] 내림차순."""
+        with self._lock:
+            items = [
+                (k.split("|"), v)
+                for k, v in self._data.get("dopamine_trails", {}).items()
+                if v >= min_count
+            ]
+        items.sort(key=lambda kv: -kv[1])
+        return items[:n]
 
     def reset_weak_spot_candidates(self) -> None:
         """후보 카운터 초기화 — 주간 회고 발송 성공 시 호출 (새 주 시작)."""
@@ -459,7 +504,8 @@ class Store:
     DAILY_STATS_MAX_DAYS = 60     # 너무 오래된 날짜는 자동 정리 (메모리·저장 비대 방지)
 
     def _today_bucket(self) -> dict:
-        """오늘 날짜의 통계 버킷을 (RLock 잡힌 상태에서) 가져온다 — 없으면 생성."""
+        """오늘 날짜의 통계 버킷을 (RLock 잡힌 상태에서) 가져온다 — 없으면 생성.
+        hourly_* 필드는 시간대별 생산성 매핑용 (0~23 시 키)."""
         today = datetime.date.today().isoformat()
         stats = self._data["daily_stats"]
         bucket = stats.get(today)
@@ -470,13 +516,25 @@ class Store:
                 "goals_registered": 0,
                 "habit_dones": 0,
                 "mood_logs": [],
+                # 시간대별 (hour 0~23) 카운터 — 기존 일별 버킷에는 영향 없음
+                "hourly_triggers": {},        # {"14": N, ...}
+                "hourly_goals_completed": {},
+                "hourly_habit_dones": {},
             }
             stats[today] = bucket
             # 오래된 날짜 자동 정리
             if len(stats) > self.DAILY_STATS_MAX_DAYS:
                 for k in sorted(stats.keys())[: len(stats) - self.DAILY_STATS_MAX_DAYS]:
                     stats.pop(k, None)
+        # 기존 버킷에 hourly 필드 누락 시 보강 (마이그레이션)
+        bucket.setdefault("hourly_triggers", {})
+        bucket.setdefault("hourly_goals_completed", {})
+        bucket.setdefault("hourly_habit_dones", {})
         return bucket
+
+    @staticmethod
+    def _hour_key() -> str:
+        return str(datetime.datetime.now().hour)
 
     def add_mood_log(self, rating: int, note: str = "") -> None:
         """오늘 자 통계에 가벼운 mood 기록 (1~5) + 메모. behavioral activation
@@ -498,13 +556,15 @@ class Store:
 
     def bump_trigger_fire(self, trigger_value: str) -> None:
         """잔소리가 실제 발송된 트리거를 오늘 자 통계에 +1. 쿨다운으로 스킵된
-        건 카운트하지 않는다 — 사용자 체감 패턴만 잡기 위함."""
+        건 카운트하지 않는다 — 사용자 체감 패턴만 잡기 위함. 시간대 카운터도 같이."""
         label = (trigger_value or "").strip()
         if not label:
             return
         with self._lock:
             bucket = self._today_bucket()
             bucket["triggers"][label] = bucket["triggers"].get(label, 0) + 1
+            hk = self._hour_key()
+            bucket["hourly_triggers"][hk] = bucket["hourly_triggers"].get(hk, 0) + 1
             self._persist()
 
     @property
@@ -536,6 +596,76 @@ class Store:
             "window_days": days,
             "recent": _aggregate_buckets(recent_buckets),
             "previous": _aggregate_buckets(previous_buckets),
+        }
+
+    def hourly_breakdown(self, days: int = 14) -> dict:
+        """최근 N일 활동을 시간(hour) 별로 집계. 사용자 골든타임(완료가 가장 많은
+        시간대)과 위험 시간대(트리거가 가장 많이 잡힌 시간대) 도출에 사용.
+
+        반환 형태:
+            {
+              "window_days": N,
+              "total_days_with_data": ...,
+              "hours": {
+                "0": {"triggers": N, "goals_completed": N, "habit_dones": N},
+                ...
+              },
+              "golden_hours": [(hour, completed_count), ...],   # 상위 3개
+              "risk_hours":   [(hour, trigger_count),   ...],   # 상위 3개
+            }
+        """
+        today = datetime.date.today()
+        target_dates = [
+            (today - datetime.timedelta(days=i)).isoformat() for i in range(days)
+        ]
+        hours: Dict[int, Dict[str, int]] = {
+            h: {"triggers": 0, "goals_completed": 0, "habit_dones": 0}
+            for h in range(24)
+        }
+        days_with_data = 0
+        with self._lock:
+            stats = self._data["daily_stats"]
+            for d in target_dates:
+                b = stats.get(d)
+                if not b:
+                    continue
+                ht = b.get("hourly_triggers") or {}
+                hg = b.get("hourly_goals_completed") or {}
+                hh = b.get("hourly_habit_dones") or {}
+                if ht or hg or hh:
+                    days_with_data += 1
+                for hk, v in ht.items():
+                    try:
+                        hours[int(hk)]["triggers"] += int(v or 0)
+                    except Exception:
+                        pass
+                for hk, v in hg.items():
+                    try:
+                        hours[int(hk)]["goals_completed"] += int(v or 0)
+                    except Exception:
+                        pass
+                for hk, v in hh.items():
+                    try:
+                        hours[int(hk)]["habit_dones"] += int(v or 0)
+                    except Exception:
+                        pass
+        # 정렬: 골든타임 = goals_completed + habit_dones 합산 상위 / 위험 = triggers 상위
+        scored_gold = sorted(
+            ((h, hours[h]["goals_completed"] + hours[h]["habit_dones"]) for h in hours),
+            key=lambda kv: -kv[1],
+        )
+        scored_risk = sorted(
+            ((h, hours[h]["triggers"]) for h in hours),
+            key=lambda kv: -kv[1],
+        )
+        golden = [(h, c) for h, c in scored_gold if c > 0][:3]
+        risk = [(h, c) for h, c in scored_risk if c > 0][:3]
+        return {
+            "window_days": days,
+            "total_days_with_data": days_with_data,
+            "hours": {str(h): hours[h] for h in hours},
+            "golden_hours": golden,
+            "risk_hours": risk,
         }
 
     def mood_correlation(self, days: int = 14) -> dict:
@@ -676,6 +806,18 @@ class Store:
     @last_late_night_fired.setter
     def last_late_night_fired(self, value: Optional[str]) -> None:
         self._set("last_late_night_fired", value)
+
+    # ----------------------------------------------------- 위험 예측 1일 1회
+    def risk_predict_already_fired_today(self) -> bool:
+        """오늘 위험 예측 알림이 이미 발사되었는지. 부담 완화 위해 1일 1회."""
+        rec = self._get("last_risk_predict") or {}
+        return rec.get("date") == datetime.date.today().isoformat()
+
+    def mark_risk_predict_fired(self, hour: int) -> None:
+        self._set("last_risk_predict", {
+            "date": datetime.date.today().isoformat(),
+            "hour": int(hour),
+        })
 
     # ----------------------------------------------------- 과부하 자체 점검
     @property
@@ -912,6 +1054,10 @@ class Store:
                     leveled_up = True
                 bucket = self._today_bucket()
                 bucket["habit_dones"] = bucket.get("habit_dones", 0) + 1
+                hk = self._hour_key()
+                bucket["hourly_habit_dones"][hk] = (
+                    bucket["hourly_habit_dones"].get(hk, 0) + 1
+                )
                 self._persist()
 
             levels = habit.get("levels") or []
@@ -988,4 +1134,36 @@ class Store:
             self._data["events"] = []
             self._data["habits"] = []
             self._data["implementation_intentions"] = []
+            self._persist()
+
+    def hard_reset(self) -> None:
+        """`/reset all` — 통계·설정·자기학습까지 *전부* 비운다. chat_id 는 유지
+        (봇 등록 자체는 살려두는 게 자연스러움). 위험한 작업이라 명시 옵션 필요."""
+        with self._lock:
+            chat_id = self._data.get("chat_id")
+            # 새 Store 인스턴스 만들 때와 같은 초기 상태로 복귀
+            self._data["chat_id"] = chat_id
+            self._data["today_goals"] = []
+            self._data["long_term_goal"] = None
+            self._data["progress"] = None
+            self._data["next_step"] = None
+            self._data["profile"] = {}
+            self._data["weak_spots"] = []
+            self._data["alarms"] = []
+            self._data["events"] = []
+            self._data["habits"] = []
+            self._data["history"] = []
+            self._data["nag_policy"] = "balanced"
+            self._data["nag_policy_asked"] = False
+            self._data["nag_policy_temp"] = ""
+            self._data["nag_policy_temp_until"] = 0.0
+            self._data["nag_policy_recovery_pending"] = False
+            self._data["daily_stats"] = {}
+            self._data["last_weekly_review"] = None
+            self._data["last_overload_checkin"] = None
+            self._data["last_late_night_fired"] = None
+            self._data["implementation_intentions"] = []
+            self._data["weak_spot_candidates"] = {}
+            self._data["pending_messages"] = []
+            self._data["pending_chat_reply"] = None
             self._persist()

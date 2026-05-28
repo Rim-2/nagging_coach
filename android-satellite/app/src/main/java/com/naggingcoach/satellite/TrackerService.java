@@ -336,6 +336,7 @@ public class TrackerService extends Service {
             String label = appPkg.contains(".") ? getAppLabel(appPkg) : appPkg;
             String body = "{"
                     + "\"trigger\":\"" + escapeJson(triggerValue) + "\","
+                    + "\"device\":\"phone\","
                     + "\"snapshot\":{"
                     + "\"active_window\":\"" + escapeJson(label) + "\","
                     + "\"idle_time\":0,"
