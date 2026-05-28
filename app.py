@@ -283,6 +283,9 @@ class CoachApp:
         threading.Thread(
             target=self._weekly_review_loop, name="WeeklyReview", daemon=True
         ).start()
+        threading.Thread(
+            target=self._retry_loop, name="Retry", daemon=True
+        ).start()
         self._start_http_server()
 
         print("[App] 실행 중. Ctrl+C 로 종료.")
@@ -465,7 +468,14 @@ class CoachApp:
             self._note_ai_failure(chat_id, exc)
             return
         self._consecutive_ai_failures = 0
-        self._send(chat_id, reply)
+        if self._send(chat_id, reply):
+            # 직전 turn 에 못 보낸 답장이 있었다면 새 답장에 통합되어 갔으니 클리어.
+            self._store.clear_pending_chat_reply()
+        else:
+            # chat 답장은 retry 큐 X — 시간 지나서 따로 도착하면 어색.
+            # 대신 다음 사용자 메시지 때 LLM 이 합쳐 답하도록 보관.
+            print("[App] chat 답장 전송 실패 → pending_chat_reply 보관")
+            self._store.set_pending_chat_reply(reply)
 
     def _handle_photo(self, chat_id: int, photo: list, caption: str) -> None:
         """완료 증거 사진을 받아 AI 비전 판독으로 처리한다."""
@@ -483,7 +493,11 @@ class CoachApp:
             self._note_ai_failure(chat_id, exc)
             return
         self._consecutive_ai_failures = 0
-        self._send(chat_id, reply)
+        if self._send(chat_id, reply):
+            self._store.clear_pending_chat_reply()
+        else:
+            print("[App] 사진 답장 전송 실패 → pending_chat_reply 보관")
+            self._store.set_pending_chat_reply(reply)
 
     # ==================================================== Tracker 콜백
     def _on_trigger(self, trigger: TriggerType, snap: Snapshot) -> None:
@@ -517,6 +531,7 @@ class CoachApp:
         }
         description = self._describe_trigger(trigger.value, snap_dict, goal)
         description += self._escalation_note()
+        description += self._policy_recovery_note()
         try:
             reply = self._agent.handle_event(description)
         except AIGenerationError as exc:
@@ -526,17 +541,16 @@ class CoachApp:
 
         self._consecutive_ai_failures = 0
         print(f"[App] 트리거 [{trigger.value}] → 잔소리 발송")
-        sent_ok = self._send(chat_id, reply)
+        # 자기학습 weak_spot 후보 — sanitized 라벨 (PC 환경)
+        from tracker import sanitize_window_title
+        label = sanitize_window_title(snap.active_window)
+        se = {
+            "trigger_value": trigger.value,
+            "weak_spot_candidate": label if (label and label != "other") else "",
+            "mark_policy_asked": True,
+        }
+        self._send_or_enqueue(chat_id, reply, kind="local_trigger", side_effects=se)
         self._arm_warning_timeout()
-        if sent_ok:
-            self._store.bump_trigger_fire(trigger.value)
-            # 자기학습 weak_spot 후보 — sanitized 라벨 (PC 환경)
-            from tracker import sanitize_window_title
-            label = sanitize_window_title(snap.active_window)
-            if label and label != "other":
-                self._store.bump_weak_spot_candidate(label)
-            if not self._store.nag_policy_asked:
-                self._store.nag_policy_asked = True
 
     @staticmethod
     def _describe_trigger(
@@ -608,6 +622,84 @@ class CoachApp:
             )
         return body + goal_note
 
+    # =========================================== 텔레그램 전송 + retry 큐
+    # 잔소리/자동 메시지는 "도착 시점에" 부수효과(쿨다운·통계·자기학습)가 적용
+    # 되어야 한다. 첫 시도 성공 시 즉시 / 큐 도달 성공 시 워커가 같은 함수를
+    # 호출하여 일관성 유지.
+
+    def _apply_message_side_effects(self, kind: str, se: dict) -> None:
+        """잔소리·자동 메시지가 사용자에게 *실제 도달했을 때* 적용되는 부수효과."""
+        if kind == "remote_trigger":
+            tv = se.get("trigger_value")
+            if tv:
+                with self._remote_cooldown_lock:
+                    self._remote_cooldowns[tv] = time.time() + REMOTE_TRIGGER_COOLDOWN_SEC
+                self._store.bump_trigger_fire(tv)
+            weak = se.get("weak_spot_candidate")
+            if weak:
+                self._store.bump_weak_spot_candidate(weak)
+            if se.get("is_late_night"):
+                self._store.last_late_night_fired = (
+                    datetime.datetime.now().date().isoformat()
+                )
+            if se.get("mark_policy_asked") and not self._store.nag_policy_asked:
+                self._store.nag_policy_asked = True
+        elif kind == "local_trigger":
+            tv = se.get("trigger_value")
+            if tv:
+                self._store.bump_trigger_fire(tv)
+            weak = se.get("weak_spot_candidate")
+            if weak:
+                self._store.bump_weak_spot_candidate(weak)
+            if se.get("mark_policy_asked") and not self._store.nag_policy_asked:
+                self._store.nag_policy_asked = True
+        elif kind == "weekly_review":
+            # last_weekly_review 는 날짜 문자열 (YYYY-MM-DD) — 같은 일요일 중복 발송 가드.
+            self._store.last_weekly_review = datetime.date.today().isoformat()
+            self._store.reset_weak_spot_candidates()
+        elif kind == "overload_checkin":
+            self._store.last_overload_checkin = time.time()
+        elif kind == "event_reminder":
+            eid = se.get("event_id")
+            if eid:
+                self._store.mark_event_reminded(eid)
+        # alarm·focus_session_end·proactive_checkin·system_notice 는 부수효과 없음.
+
+    def _send_or_enqueue(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        kind: str,
+        side_effects: Optional[dict] = None,
+    ) -> bool:
+        """잔소리·자동 메시지 전용 발송. 첫 시도(짧은 backoff 포함) 성공 시
+        부수효과 즉시 적용, 실패 시 큐에 적재해 워커가 도달할 때까지 retry.
+
+        반환: True = 첫 시도 도달 / False = 큐에 적재됨 (호출자는 추가 부수
+        효과 코드를 두지 마라 — 모두 _apply_message_side_effects 에서)."""
+        se = side_effects or {}
+        if self._send(chat_id, text):
+            self._apply_message_side_effects(kind, se)
+            return True
+        msg_id = self._store.add_pending_message(
+            kind=kind, chat_id=chat_id, text=text, side_effects=se
+        )
+        print(f"[App] 전송 실패 → retry 큐 적재 (kind={kind}, id={msg_id[:8]})")
+        return False
+
+    def _policy_recovery_note(self) -> str:
+        """일시 톤다운 (컨디션 신호로 적용된 24h gentle) 이 막 만료되었을 때,
+        다음 잔소리에 자연스러운 복귀 코멘트를 끼우게 가이드. 한 번만 발동."""
+        if not self._store.consume_policy_recovery_note():
+            return ""
+        base = self._store.nag_policy
+        return (
+            f" (어제 컨디션 신호 때문에 하루 톤이 부드러웠어. 이제 평소 톤"
+            f"({base})으로 돌아갈 차례 — 답장 자연스러운 한 곳에 '오늘은 좀 "
+            f"빡세게 가볼까' 같은 톤 전환을 한 줄 끼워.)"
+        )
+
     def _escalation_note(self) -> str:
         """잔소리 무시 누적 시 description 끝에 붙일 코치 가이드. nag_policy 별
         방향이 다르다 — strict 만 압박을 올리고, gentle/balanced(3회 이상) 은
@@ -615,7 +707,8 @@ class CoachApp:
         n = self._ignored_nags
         if n <= 0:
             return ""
-        policy = self._store.nag_policy
+        # 일시 gentle 적용 중에도 톤다운 가이드가 들어가야 사용자가 압박 못 받음.
+        policy = self._store.active_nag_policy
         if policy == "gentle":
             return (
                 f" (사용자가 잔소리를 {n}번 답 없이 지나갔어 — 더 다그치지 말고 "
@@ -695,6 +788,7 @@ class CoachApp:
 
         description = self._describe_trigger(trigger_value, snap, goal)
         description += self._escalation_note()
+        description += self._policy_recovery_note()
         try:
             reply = self._agent.handle_event(description)
         except AIGenerationError as exc:
@@ -703,28 +797,19 @@ class CoachApp:
 
         self._consecutive_ai_failures = 0
         print(f"[App] (원격) 트리거 [{trigger_value}] → 잔소리 발송")
-        sent_ok = self._send(chat_id, reply)
+        # 부수효과 메타 — 첫 시도 성공 시 즉시, 큐 도달 시 워커가 적용
+        se = {
+            "trigger_value": trigger_value,
+            "weak_spot_candidate": snap.get("active_window") or "",
+            "is_late_night": trigger_value == "늦은 밤",
+            "mark_policy_asked": True,
+        }
+        delivered = self._send_or_enqueue(
+            chat_id, reply, kind="remote_trigger", side_effects=se
+        )
         self._arm_warning_timeout()
-        if not sent_ok:
-            # 텔레그램 전송 실패 — 사용자가 받지 못했으므로 쿨다운·통계·학습 모두
-            # 적용 안 함. 다음 트리거 시도가 즉시 가능해야 시연/운영 흐름이 안 깨짐.
-            return {"ok": False, "action": "failed", "reason": "telegram_send_failed"}
-        with self._remote_cooldown_lock:
-            self._remote_cooldowns[trigger_value] = (
-                time.time() + REMOTE_TRIGGER_COOLDOWN_SEC
-            )
-        self._store.bump_trigger_fire(trigger_value)
-        # 자기학습 weak_spot 후보 — 폰 위성이 보낸 active_window (앱 패키지명)
-        app_label = snap.get("active_window") or ""
-        if app_label:
-            self._store.bump_weak_spot_candidate(app_label)
-        # 늦은 밤은 하루 한 번 — 발사 성공 시 오늘 날짜 마크
-        if trigger_value == "늦은 밤":
-            self._store.last_late_night_fired = (
-                datetime.datetime.now().date().isoformat()
-            )
-        if not self._store.nag_policy_asked:
-            self._store.nag_policy_asked = True
+        if not delivered:
+            return {"ok": True, "action": "queued", "reason": "telegram_retry_queue"}
         return {"ok": True, "action": "nag_sent"}
 
     # ====================================================== 도구 콜백
@@ -802,8 +887,7 @@ class CoachApp:
                     print(f"[App] 과부하 점검 생성 실패: {exc}")
                     continue
                 print("[App] 과부하 점검 메시지 발송")
-                if self._send(chat_id, reply):
-                    self._store.last_overload_checkin = now
+                self._send_or_enqueue(chat_id, reply, kind="overload_checkin")
                 continue
             try:
                 reply = self._agent.proactive_checkin()
@@ -811,7 +895,7 @@ class CoachApp:
                 print(f"[App] 프로액티브 생성 실패: {exc}")
                 continue
             print("[App] 프로액티브 메시지 발송")
-            self._send(chat_id, reply)
+            self._send_or_enqueue(chat_id, reply, kind="proactive_checkin")
 
     def _should_check_overload(self, now: float) -> bool:
         """과부하 점검 메시지를 띄울 시그널 충족 여부.
@@ -850,11 +934,12 @@ class CoachApp:
                         continue
                     minutes = (start - now_utc).total_seconds() / 60.0
                     if 0 < minutes <= REMINDER_LEAD_MIN:
-                        sent = self._send_event_reminder(
+                        self._send_event_reminder(
                             chat_id, ev.get("summary", "일정"), int(minutes)
                         )
-                        if sent:  # 발송 성공 시에만 마크 — 실패 시 다음 폴링 재시도
-                            reminded_google.add(eid)
+                        # 큐가 도달 책임을 가져가므로 무조건 마크 (메모리 set 이라 봇
+                        # 재시작 시 리셋 — 영구 마크 아님).
+                        reminded_google.add(eid)
 
             # --- 봇 자체 일정 (Google 인증 무관) ---
             # 발사 윈도우: [start_ts - lead_sec, start_ts + GRACE].
@@ -873,27 +958,39 @@ class CoachApp:
                 if now_ts < window_start or now_ts > window_end:
                     continue
                 minutes_left = max(0, int((start_ts - now_ts) / 60))
-                sent = self._send_event_reminder(
-                    chat_id, ev.get("summary", "일정"), minutes_left
+                # event_id 를 넘기면 큐 도달 시점에 영구 마크가 자동 적용된다.
+                self._send_event_reminder(
+                    chat_id,
+                    ev.get("summary", "일정"),
+                    minutes_left,
+                    event_id=ev["id"],
                 )
-                if sent:  # 발송 성공 시에만 영구 마크 — 실패 시 다음 폴링 재시도
-                    self._store.mark_event_reminded(ev["id"])
 
             # 지난 일정은 자동 정리 (메모리·저장 비대 방지)
             self._store.prune_past_events()
 
     def _send_event_reminder(
-        self, chat_id: int, summary: str, minutes: int
+        self,
+        chat_id: int,
+        summary: str,
+        minutes: int,
+        *,
+        event_id: Optional[str] = None,
     ) -> bool:
-        """일정 미리 알림 발송. 발송 성공 여부를 반환한다 — 호출자는 이걸
-        보고 reminded 마크 여부를 결정 (실패 시 마크 X → 다음 폴링 재시도)."""
+        """일정 미리 알림 발송. 첫 시도 성공 또는 큐 적재 둘 다 True 로 간주
+        (큐가 도달까지 책임짐 — '한 번은 보냈다'고 마킹). 호출자는 이 결과로
+        reminded 마크 여부 결정. event_id 가 주어지면 큐 도달 시점에 자체 일정
+        영구 마크가 자동 적용된다."""
         try:
             msg = self._agent.event_reminder(summary, minutes)
         except AIGenerationError as exc:
             print(f"[App] 리마인더 생성 실패 — 기본 문구 사용: {exc}")
             msg = f"곧 '{summary}' 시작이야 — {minutes}분 남았어!"
         print(f"[App] 일정 리마인더 발송: {summary} ({minutes}분 전)")
-        return self._send(chat_id, msg)
+        se = {"event_id": event_id} if event_id else None
+        self._send_or_enqueue(chat_id, msg, kind="event_reminder", side_effects=se)
+        # 큐 적재 여부와 무관하게 마크 — 워커가 끝까지 도달 책임짐.
+        return True
 
     @staticmethod
     def _parse_event_start(value: Optional[str]):
@@ -945,8 +1042,8 @@ class CoachApp:
             self._store.replace_alarms(kept)
 
     def _fire_alarm(self, chat_id: int, alarm: dict) -> bool:
-        """알람 메시지 생성 후 발송. 발송 성공 여부를 반환 — 호출자가 보고
-        once 알람의 retry/삭제 여부를 결정."""
+        """알람 메시지 생성 후 발송. retry 큐가 도달 책임을 지므로 항상 True 를
+        리턴 — '한 번은 보냈다'고 마킹해 once 알람은 큐에 위임 후 즉시 삭제."""
         text = alarm.get("text", "알람")
         if text.startswith(FOCUS_END_MARKER):
             what = text[len(FOCUS_END_MARKER):].strip() or "집중 작업"
@@ -956,6 +1053,7 @@ class CoachApp:
                 print(f"[App] focus 세션 종료 메시지 생성 실패: {exc}")
                 msg = f"⏰ '{what}' 집중 세션 끝났어! 어땠어? 더 갈래, 쉴래, 끝낼래?"
             print(f"[App] focus 세션 종료 발송: {what}")
+            self._send_or_enqueue(chat_id, msg, kind="focus_session_end")
         else:
             try:
                 msg = self._agent.deliver_alarm(text)
@@ -963,7 +1061,77 @@ class CoachApp:
                 print(f"[App] 알람 메시지 생성 실패 — 기본 문구 사용: {exc}")
                 msg = f"⏰ 알람: {text}"
             print(f"[App] 알람 발송: {text}")
-        return self._send(chat_id, msg)
+            self._send_or_enqueue(chat_id, msg, kind="alarm")
+        return True
+
+    # =================================================== retry 큐 워커
+    # exponential backoff (분 단위). 도달 못한 메시지는 점점 긴 간격으로 시도.
+    # cap = 30분: 며칠짜리 장애도 그 사이에 풀리면 도달 가능.
+    _RETRY_BACKOFF_MIN = (1, 2, 4, 8, 16, 30)
+    _RETRY_CHECK_INTERVAL = 30.0   # 큐 폴링 주기 (초)
+    _RETRY_MAX_AGE_SEC = 7 * 24 * 3600.0  # 일주일 지나도 못 보내면 폐기
+
+    def _retry_backoff_sec(self, attempts: int) -> float:
+        idx = min(attempts, len(self._RETRY_BACKOFF_MIN) - 1)
+        return self._RETRY_BACKOFF_MIN[idx] * 60.0
+
+    def _retry_loop(self) -> None:
+        """텔레그램 전송 실패로 큐에 적재된 잔소리·자동 메시지를 도착할 때까지
+        재시도. 도착 시점에 부수효과(쿨다운·통계·자기학습)도 적용.
+        주의: 같은 chat 에 여러 메시지가 큐에 있으면 *발사 순서대로* 처리해
+        시간 역순 도착을 막는다 (먼저 적재된 메시지가 먼저 도달)."""
+        while not self._stop.wait(self._RETRY_CHECK_INTERVAL):
+            pending = self._store.list_pending_messages()
+            if not pending:
+                continue
+            # 발사 순서 (created_at) 오름차순 — 시간 역순 도착 방지
+            pending.sort(key=lambda it: it.get("created_at", 0.0))
+            now = time.time()
+            for item in pending:
+                if self._stop.is_set():
+                    break
+                # 너무 오래 묵은 항목은 폐기 (적재된 지 일주일 이상)
+                age = now - float(item.get("created_at", now))
+                if age > self._RETRY_MAX_AGE_SEC:
+                    print(
+                        f"[App] retry 큐 항목 만료 폐기 "
+                        f"(kind={item.get('kind')}, age={age/3600:.1f}h)"
+                    )
+                    self._store.remove_pending_message(item["id"])
+                    continue
+                # next_attempt_at 안 된 항목은 통과
+                if now < float(item.get("next_attempt_at", 0.0)):
+                    continue
+                # 시도
+                ok = self._tg.send_message(item["chat_id"], item["text"])
+                if ok:
+                    self._consecutive_tg_failures = 0
+                    print(
+                        f"[App] retry 도달 "
+                        f"(kind={item.get('kind')}, "
+                        f"attempts={item.get('attempts', 0) + 1})"
+                    )
+                    # 부수효과 적용 후 큐에서 제거
+                    try:
+                        self._apply_message_side_effects(
+                            item.get("kind", ""), item.get("side_effects", {}) or {}
+                        )
+                    except Exception as exc:
+                        print(f"[App] retry 도달 후 부수효과 적용 실패: {exc}")
+                    self._store.remove_pending_message(item["id"])
+                else:
+                    # backoff — 다음 시도 시각 갱신
+                    delay = self._retry_backoff_sec(
+                        int(item.get("attempts", 0)) + 1
+                    )
+                    self._store.update_pending_attempt(item["id"], now + delay)
+                    print(
+                        f"[App] retry 실패 → {delay/60:.0f}분 후 재시도 "
+                        f"(kind={item.get('kind')}, "
+                        f"attempts={item.get('attempts', 0) + 1})"
+                    )
+                # 한 사이클에 한 메시지씩만 — Telegram API rate-limit 회피
+                break
 
     # ============================================== 원격 트리거 HTTP 서버
     def _start_http_server(self) -> None:
@@ -1015,10 +1183,7 @@ class CoachApp:
                 print(f"[App] 주간 회고 생성 실패: {exc}")
                 continue
             print("[App] 주간 회고 발송")
-            if self._send(chat_id, reply):
-                self._store.last_weekly_review = today_s
-                # 자기학습 weak_spot 후보 카운터 reset — 새 주 시작
-                self._store.reset_weak_spot_candidates()
+            self._send_or_enqueue(chat_id, reply, kind="weekly_review")
 
     # ====================================================== 매일 재시작
     def _daily_restart_loop(self) -> None:
@@ -1057,10 +1222,22 @@ class CoachApp:
             )
             self._consecutive_ai_failures = 0
 
+    # 텔레그램 일시 장애(API timeout 등)에 대응하는 *짧은* 동기 retry 백오프.
+    # 합계 약 7초. 이걸로 못 잡는 더 긴 장애는 호출자가 retry 큐로 위임한다.
+    _SEND_BACKOFF_SEC = (1.0, 2.0, 4.0)
+
     def _send(self, chat_id: int, text: str) -> bool:
-        """텔레그램 발송 wrapper. 연속 실패가 임계치를 넘으면 컨테이너 자살 →
-        Railway가 자동 재시작 (사람 개입 없이 누적 네트워크 문제 복구)."""
+        """텔레그램 발송 wrapper. 일시적 실패에 짧은 backoff retry. 그래도
+        실패하면 False — 잔소리/자동 메시지 경로는 영구 retry 큐에 적재하고,
+        대화 답장은 pending_chat_reply 에 보관해 다음 turn 에 합쳐 답하도록.
+        연속 실패가 임계치를 넘으면 컨테이너 자살 → Railway 자동 재시작."""
         ok = self._tg.send_message(chat_id, text)
+        # 첫 시도 실패 시 짧게 점진적 backoff.
+        for delay in self._SEND_BACKOFF_SEC:
+            if ok:
+                break
+            time.sleep(delay)
+            ok = self._tg.send_message(chat_id, text)
         if ok:
             self._consecutive_tg_failures = 0
             return True

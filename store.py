@@ -98,12 +98,25 @@ class Store:
             "history": [],
             "nag_policy": "balanced",
             "nag_policy_asked": False,
+            # 컨디션 토로로 일시 적용된 톤. 만료되면 base(nag_policy) 로 복귀.
+            "nag_policy_temp": "",
+            "nag_policy_temp_until": 0.0,     # unix timestamp
+            # 직전 호출에서 temp 가 막 만료되었으면 True — 다음 잔소리에 자연스러운
+            # '톤 복귀' 코멘트를 끼우기 위한 1회용 플래그. 소비 후 자동 False.
+            "nag_policy_recovery_pending": False,
             "daily_stats": {},
             "last_weekly_review": None,
             "last_overload_checkin": None,
             "last_late_night_fired": None,  # YYYY-MM-DD — 하루 한 번 제약 영속화
             "implementation_intentions": [],
             "weak_spot_candidates": {},
+            # 텔레그램 전송 실패 시 영구 retry 큐. 잔소리·자동 메시지 전용.
+            # 항목: {id, kind, chat_id, text, side_effects, attempts,
+            #        next_attempt_at, first_attempt_at, created_at}
+            "pending_messages": [],
+            # 대화 답장 (사용자 chat 응답) 이 전송 실패했을 때 *한 개*만 보관.
+            # 다음 사용자 메시지 도착 시 LLM 이 합쳐 답하도록 state_summary 에 노출.
+            "pending_chat_reply": None,
         }
         self._load()
 
@@ -359,6 +372,89 @@ class Store:
             self._data["weak_spot_candidates"] = {}
             self._persist()
 
+    # ----------------------------------------------------- 텔레그램 retry 큐
+    # 텔레그램 전송 실패 시 잔소리·자동 메시지는 영구 큐에 적재되어 백그라운드
+    # 워커가 backoff 로 retry 한다. 최종 도달 시점에 부수효과(쿨다운·통계·자기학습)
+    # 가 적용되도록, 부수효과 메타도 큐 항목에 함께 보관한다.
+
+    def add_pending_message(
+        self,
+        *,
+        kind: str,
+        chat_id: int,
+        text: str,
+        side_effects: Optional[dict] = None,
+    ) -> str:
+        """새 retry 항목을 큐에 적재. 반환: 새 항목 id."""
+        import uuid
+        with self._lock:
+            now = time.time()
+            item = {
+                "id": uuid.uuid4().hex,
+                "kind": kind,
+                "chat_id": chat_id,
+                "text": text,
+                "side_effects": side_effects or {},
+                "attempts": 0,
+                "first_attempt_at": now,
+                "next_attempt_at": now,   # 즉시 첫 워커 시도
+                "created_at": now,
+            }
+            self._data["pending_messages"].append(item)
+            self._persist()
+            return item["id"]
+
+    def list_pending_messages(self) -> List[dict]:
+        """워커 폴링용 — 큐 사본을 돌려준다 (외부 mutation 보호)."""
+        with self._lock:
+            return [dict(it) for it in self._data["pending_messages"]]
+
+    def update_pending_attempt(self, msg_id: str, next_attempt_at: float) -> None:
+        """retry 실패 후 다음 시도 시각을 갱신 + attempts 증가."""
+        with self._lock:
+            for it in self._data["pending_messages"]:
+                if it["id"] == msg_id:
+                    it["attempts"] = int(it.get("attempts", 0)) + 1
+                    it["next_attempt_at"] = float(next_attempt_at)
+                    self._persist()
+                    return
+
+    def remove_pending_message(self, msg_id: str) -> Optional[dict]:
+        """retry 성공·만료 시 큐에서 제거. 제거된 항목 반환."""
+        with self._lock:
+            queue = self._data["pending_messages"]
+            for i, it in enumerate(queue):
+                if it["id"] == msg_id:
+                    removed = queue.pop(i)
+                    self._persist()
+                    return removed
+        return None
+
+    # --------------------------------------- 대화 답장 (chat reply) 펜딩 박스
+    # 잔소리는 *재발사*가 자연스럽지만, 사용자 chat 에 대한 답장은 시간이 지나서
+    # 따로 도착하면 어색하다. 그래서 chat 답장은 retry 하지 않고 한 개만 보관 →
+    # 사용자가 다음 메시지를 보낼 때 LLM 이 이전 답장 못 전달한 사실을 알고
+    # 자연스럽게 합쳐서 답하도록 _state_summary 에 노출한다.
+
+    def set_pending_chat_reply(self, text: str) -> None:
+        with self._lock:
+            self._data["pending_chat_reply"] = {
+                "text": text,
+                "at": time.time(),
+            }
+            self._persist()
+
+    def get_pending_chat_reply(self) -> Optional[dict]:
+        with self._lock:
+            data = self._data.get("pending_chat_reply")
+            return dict(data) if data else None
+
+    def clear_pending_chat_reply(self) -> None:
+        with self._lock:
+            if self._data.get("pending_chat_reply") is not None:
+                self._data["pending_chat_reply"] = None
+                self._persist()
+
     # --------------------------------------------------------- 일별 통계
     DAILY_STATS_MAX_DAYS = 60     # 너무 오래된 날짜는 자동 정리 (메모리·저장 비대 방지)
 
@@ -594,6 +690,8 @@ class Store:
     # --------------------------------------------------------- 잔소리 강도
     @property
     def nag_policy(self) -> str:
+        """사용자가 명시 발화로 설정한 *base* 톤. 컨디션 토로로 인한 일시 톤다운은
+        `active_nag_policy` 가 별도로 합쳐 돌려준다."""
         val = self._get("nag_policy")
         return val if val in ("gentle", "balanced", "strict") else "balanced"
 
@@ -601,6 +699,45 @@ class Store:
     def nag_policy(self, value: str) -> None:
         if value in ("gentle", "balanced", "strict"):
             self._set("nag_policy", value)
+
+    @property
+    def active_nag_policy(self) -> str:
+        """현재 활성 톤. temp 가 살아있으면 temp, 만료됐거나 없으면 base.
+        만료 순간을 잡아 `nag_policy_recovery_pending` 플래그를 세워둔다 — 다음
+        잔소리 발사 시 자연스러운 복귀 코멘트를 끼울 수 있게."""
+        with self._lock:
+            temp = self._data.get("nag_policy_temp") or ""
+            until = float(self._data.get("nag_policy_temp_until") or 0.0)
+            if temp and time.time() < until:
+                return temp if temp in ("gentle", "balanced", "strict") else self.nag_policy
+            # temp 가 있었는데 만료됐으면 — 정리 + 복귀 플래그 세움.
+            if temp:
+                self._data["nag_policy_temp"] = ""
+                self._data["nag_policy_temp_until"] = 0.0
+                self._data["nag_policy_recovery_pending"] = True
+                self._persist()
+            return self.nag_policy
+
+    def apply_temporary_policy(self, policy: str, duration_sec: float = 86400.0) -> None:
+        """컨디션 신호로 일시 톤다운을 적용. base 는 안 건드림."""
+        if policy not in ("gentle", "balanced", "strict"):
+            return
+        with self._lock:
+            self._data["nag_policy_temp"] = policy
+            self._data["nag_policy_temp_until"] = time.time() + duration_sec
+            # 활성 톤이 다시 바뀌었으니 이전에 세워진 복귀 플래그는 무효.
+            self._data["nag_policy_recovery_pending"] = False
+            self._persist()
+
+    def consume_policy_recovery_note(self) -> bool:
+        """복귀가 막 일어났으면 True 한 번. 잔소리 답장에 자연스러운 코멘트
+        끼우는 용도로 한 번 소비하면 자동 False 로 내려간다."""
+        with self._lock:
+            if self._data.get("nag_policy_recovery_pending"):
+                self._data["nag_policy_recovery_pending"] = False
+                self._persist()
+                return True
+            return False
 
     @property
     def nag_policy_asked(self) -> bool:
