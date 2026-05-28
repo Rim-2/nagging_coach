@@ -436,6 +436,29 @@ class CoachAgent:
                 + " — 이 중 *대화 흐름에 자연스러운* 한 가지만 가끔 슬쩍 물어봐 "
                 "(취조 X, 한 turn 에 여러 개 X)."
             )
+        # 폰 디바이스 컨텍스트 — 최근 1시간 안에 보고된 게 있으면 노출. 코치가
+        # 답장에 '오늘 200걸음밖에 안 됐네' 같이 자연스럽게 끌어올 수 있게.
+        try:
+            ctx = self._store.phone_context
+            ctx_age = time.time() - float(ctx.get("at") or 0.0)
+            if ctx and ctx_age < 3600.0:
+                bits = []
+                place = ctx.get("place_category")
+                if place and place != "other":
+                    bits.append(f"지금 '{place}' 에 있음")
+                if ctx.get("steps_today") is not None:
+                    bits.append(f"오늘 걸음 {int(ctx['steps_today'])}보")
+                if ctx.get("headphones_connected") is True:
+                    bits.append("이어폰 연결 중")
+                if ctx.get("dnd_active") is True:
+                    bits.append("폰 방해 금지(DND) 상태")
+                if ctx.get("charging") is True and ctx.get("screen_on") is False:
+                    bits.append("폰 충전 중·화면 OFF")
+                if bits:
+                    parts.append("폰 상태: " + ", ".join(bits))
+        except Exception:
+            pass
+
         # mood 추세 — 데이터 충분히 쌓이면 코치가 답장에 *짧게* 끌어와 사용자
         # 동기 부여. 너무 자주 X — 자연스러운 흐름일 때만.
         try:

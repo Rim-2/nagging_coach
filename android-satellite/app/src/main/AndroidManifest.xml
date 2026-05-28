@@ -13,6 +13,14 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <!-- 알림 (Android 13+) — Foreground service 알림 표시용 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 만보계 (Android 10+) — 사용자가 설정에서 활동 인식 권한 허용 필요 -->
+    <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
+    <!-- 위치 카테고리 — 정확 좌표는 폰 안에서 매칭하고 백엔드엔 라벨만 보냄. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <!-- Android 10+ 백그라운드 위치: Foreground service 가 켜진 상태에선 즉시 -->
+    <!-- 위치 요청이 가능하므로 BACKGROUND_LOCATION 은 *생략* — 권한 절차 부담↓ -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
 
     <application
         android:label="@string/app_name"
@@ -33,7 +41,7 @@
         <service
             android:name=".TrackerService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="dataSync|location" />
 
     </application>
 </manifest>

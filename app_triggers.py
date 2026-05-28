@@ -219,6 +219,40 @@ class TriggersMixin:
         if not trigger_value:
             return {"ok": False, "action": "skipped", "reason": "missing_trigger"}
 
+        # 폰 위성이 같이 보낸 디바이스 status (DND·충전·화면·걸음·헤드폰) 을
+        # 최신값으로 store 에 보관 — state_summary·자기 격려 메시지에서 활용.
+        if device == "phone":
+            try:
+                self._store.update_phone_context(snap)
+            except Exception as exc:
+                print(f"[App] phone_context 갱신 실패: {exc}")
+
+        # 디바이스 상태 가드 (폰 위성 페이로드에 같이 옴). 사용자가 명시적으로
+        # 방해 차단(DND)을 걸어둔 상태에선 *낮은 우선순위* 트리거는 잔소리 보류 —
+        # 약점·산만함 같은 *사용자가 등록한 진짜 약점*은 그대로 보내고, 도파민/
+        # 과몰입/도파민 스크롤 같은 *경고성* 트리거만 가드.
+        dnd_active = bool(snap.get("dnd_active"))
+        charging = bool(snap.get("charging"))
+        screen_on = snap.get("screen_on")
+        if dnd_active and trigger_value in {
+            "도파민 좀비", "능동적 도파민 스크롤", "과몰입 딴짓", "Pomodoro 휴식",
+        }:
+            print(
+                f"[App] (원격) 트리거 [{trigger_value}] DND 활성 — 잔소리 보류"
+            )
+            return {"ok": True, "action": "skipped", "reason": "dnd_active"}
+        # 늦은 밤 + 충전 중 + 화면 OFF = 진짜 잠든 신호 → 잔소리 안 보냄.
+        # screen_on 정보가 명시적으로 False 일 때만 (None 은 알 수 없음으로 처리).
+        if (
+            trigger_value == "늦은 밤"
+            and charging
+            and screen_on is False
+        ):
+            print(
+                "[App] (원격) 늦은 밤 트리거 — 충전 중 + 화면 OFF (잠든 걸로 판단) → 스킵"
+            )
+            return {"ok": True, "action": "skipped", "reason": "asleep_signal"}
+
         # 도파민 trail 학습 — 딴짓 카테고리 트리거 직전 라벨 시퀀스 누적.
         if (
             isinstance(trail, list)

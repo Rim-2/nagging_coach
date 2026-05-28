@@ -93,6 +93,22 @@ class TriggerHTTPHandler(http.server.BaseHTTPRequestHandler):
                 return
             self._respond(200, {"ok": True, "weak_spots": items})
             return
+        # 폰 위성이 매칭에 사용할 좌표 목록 — Bearer 인증 필수.
+        if self.path == "/places":
+            if not self.trigger_secret:
+                self._respond(503, {"ok": False, "error": "secret not configured"})
+                return
+            if self.headers.get("Authorization", "") != f"Bearer {self.trigger_secret}":
+                self._respond(401, {"ok": False, "error": "unauthorized"})
+                return
+            try:
+                items = self.coach_app._store.places
+            except Exception as exc:
+                print(f"[App] /places 조회 오류: {exc}")
+                self._respond(500, {"ok": False, "error": "internal"})
+                return
+            self._respond(200, {"ok": True, "places": items})
+            return
         self._respond(404, {"ok": False, "error": "not found"})
 
     def log_message(self, format, *args) -> None:  # noqa: A002

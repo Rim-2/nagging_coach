@@ -122,6 +122,26 @@ class Store:
             # 대화 답장 (사용자 chat 응답) 이 전송 실패했을 때 *한 개*만 보관.
             # 다음 사용자 메시지 도착 시 LLM 이 합쳐 답하도록 state_summary 에 노출.
             "pending_chat_reply": None,
+            # 폰 위성이 최근 트리거에 동봉해 보낸 디바이스 컨텍스트 — daily_stats
+            # 같은 누적은 폰이 들고 있고, 백엔드는 *최신값* 만 보관해 description·
+            # 자기 격려 메시지에 활용.
+            "phone_context": {
+                "steps_today": None,
+                "headphones_connected": None,
+                "dnd_active": None,
+                "charging": None,
+                "screen_on": None,
+                "place_category": None,
+                "at": 0.0,    # unix timestamp
+            },
+            # 사용자가 라벨링한 장소 — 좌표는 *매칭 전용*. 폰 위성이 GET /places
+            # 로 받아 자기 GPS와 비교 → category 만 백엔드에 보고. 좌표 자체는
+            # 트리거 페이로드에 안 들어옴 (프라이버시 보호).
+            # 항목: {label, lat, lng, radius_m}
+            "places": [],
+            # `/place 라벨` 직후 사용자가 위치 메시지를 5분 안에 보내야 등록된다.
+            "pending_place_label": None,    # str 또는 None
+            "pending_place_at": 0.0,        # unix timestamp
         }
         self._load()
 
@@ -478,6 +498,96 @@ class Store:
                     self._persist()
                     return removed
         return None
+
+    # --------------------------------------------------------- 장소 라벨
+    PLACE_DEFAULT_RADIUS_M = 200
+    PENDING_PLACE_TTL_SEC = 300.0   # /place 명령 후 5분 안에 위치 메시지 받아야
+
+    def begin_place_registration(self, label: str) -> None:
+        """/place 라벨 → 다음 위치 메시지를 받아 그 좌표로 등록 예약."""
+        with self._lock:
+            self._data["pending_place_label"] = (label or "").strip() or None
+            self._data["pending_place_at"] = time.time()
+            self._persist()
+
+    def consume_pending_place_label(self) -> Optional[str]:
+        """위치 메시지 도착 시 호출. 펜딩 라벨이 살아있으면 그걸 반환 + 클리어.
+        만료(5분)됐으면 None."""
+        with self._lock:
+            label = self._data.get("pending_place_label")
+            at = float(self._data.get("pending_place_at") or 0.0)
+            if not label or time.time() - at > self.PENDING_PLACE_TTL_SEC:
+                self._data["pending_place_label"] = None
+                self._data["pending_place_at"] = 0.0
+                return None
+            self._data["pending_place_label"] = None
+            self._data["pending_place_at"] = 0.0
+            self._persist()
+            return label
+
+    def add_place(self, label: str, lat: float, lng: float, radius_m: int = 0) -> None:
+        """라벨이 같은 기존 항목이 있으면 좌표만 덮어쓰기."""
+        label = (label or "").strip()
+        if not label:
+            return
+        if radius_m <= 0:
+            radius_m = self.PLACE_DEFAULT_RADIUS_M
+        with self._lock:
+            places = self._data.setdefault("places", [])
+            for p in places:
+                if p.get("label") == label:
+                    p["lat"] = float(lat)
+                    p["lng"] = float(lng)
+                    p["radius_m"] = int(radius_m)
+                    self._persist()
+                    return
+            places.append({
+                "label": label,
+                "lat": float(lat),
+                "lng": float(lng),
+                "radius_m": int(radius_m),
+            })
+            self._persist()
+
+    def remove_place(self, label: str) -> bool:
+        label = (label or "").strip()
+        if not label:
+            return False
+        with self._lock:
+            places = self._data.setdefault("places", [])
+            before = len(places)
+            self._data["places"] = [p for p in places if p.get("label") != label]
+            changed = len(self._data["places"]) != before
+            if changed:
+                self._persist()
+            return changed
+
+    @property
+    def places(self) -> List[dict]:
+        with self._lock:
+            return [dict(p) for p in (self._data.get("places") or [])]
+
+    # --------------------------------------------------------- 폰 컨텍스트
+    def update_phone_context(self, snap: dict) -> None:
+        """폰 위성이 트리거 페이로드에 같이 보낸 디바이스 status 를 최신값으로 갱신.
+        snap 안에 키가 없으면 기존값 유지 — 부분 갱신 안전."""
+        if not isinstance(snap, dict):
+            return
+        with self._lock:
+            ctx = self._data.setdefault("phone_context", {})
+            for key in (
+                "steps_today", "headphones_connected",
+                "dnd_active", "charging", "screen_on",
+            ):
+                if key in snap:
+                    ctx[key] = snap[key]
+            ctx["at"] = time.time()
+            self._persist()
+
+    @property
+    def phone_context(self) -> dict:
+        with self._lock:
+            return dict(self._data.get("phone_context") or {})
 
     # --------------------------------------- 대화 답장 (chat reply) 펜딩 박스
     # 잔소리는 *재발사*가 자연스럽지만, 사용자 chat 에 대한 답장은 시간이 지나서

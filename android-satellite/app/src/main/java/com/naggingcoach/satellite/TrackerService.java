@@ -8,10 +8,25 @@ import android.app.NotificationManager;
 import android.app.Service;
 import android.app.usage.UsageEvents;
 import android.app.usage.UsageStatsManager;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
+import android.location.Location;
+import android.location.LocationManager;
+import android.media.AudioDeviceInfo;
+import android.media.AudioManager;
+import android.os.BatteryManager;
 import android.os.Build;
+import java.io.InputStream;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import org.json.JSONTokener;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
@@ -88,6 +103,22 @@ public class TrackerService extends Service {
     private UsageStatsManager usm;
     private PowerManager pm;
     private PackageManager packageManager;
+    private SensorManager sensorManager;
+    private Sensor stepCounter;
+    private AudioManager audioManager;
+    private LocationManager locationManager;
+
+    // 등록된 장소 목록 — 1시간마다 백엔드 /places 에서 fetch. JSON 그대로 캐시.
+    private JSONArray cachedPlaces = new JSONArray();
+    private long placesFetchedAt = 0L;
+    private static final long PLACES_FETCH_INTERVAL_MS = 60 * 60_000L;
+
+    // 만보계 — STEP_COUNTER 는 부팅 후 누적값. 자정 마커 빼서 '오늘 걸음'.
+    // 콜백 단발성이라 onSensorChanged 마다 lifetime 갱신, getStepsToday() 가
+    // 자정 마커 갱신·차분 계산.
+    private long lifetimeStepsSnapshot = -1L;   // 최신 sensor 값
+    private long midnightStepsMark = -1L;       // 오늘 자정 시점의 lifetime 값
+    private int midnightDayOfYear = -1;
 
     // 화면 ON/OFF 누적 추적 (분 단위, POLL_INTERVAL_MS 가 1분이라 그냥 1씩)
     private int sustainedUseMin = 0;
@@ -98,6 +129,8 @@ public class TrackerService extends Service {
         @Override
         public void run() {
             try {
+                // 위치 매칭용 등록 좌표는 1시간마다 갱신 — 별도 스레드 (HTTP)
+                new Thread(() -> fetchPlacesIfStale()).start();
                 check();
             } catch (Throwable t) {
                 Log.e(TAG, "check error", t);
@@ -112,8 +145,42 @@ public class TrackerService extends Service {
         usm = (UsageStatsManager) getSystemService(USAGE_STATS_SERVICE);
         pm = (PowerManager) getSystemService(POWER_SERVICE);
         packageManager = getPackageManager();
+        audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+        locationManager = (LocationManager) getSystemService(LOCATION_SERVICE);
+        // 만보계 — ACTIVITY_RECOGNITION 권한·센서 미지원 시 stepCounter = null,
+        // getStepsToday() 가 -1 반환. 페이로드에선 omit 처리.
+        sensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
+        if (sensorManager != null) {
+            stepCounter = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER);
+            if (stepCounter != null) {
+                try {
+                    sensorManager.registerListener(
+                            stepListener, stepCounter,
+                            SensorManager.SENSOR_DELAY_NORMAL);
+                    Log.i(TAG, "step counter registered");
+                } catch (Throwable t) {
+                    Log.w(TAG, "step counter register failed", t);
+                }
+            } else {
+                Log.i(TAG, "device has no STEP_COUNTER sensor");
+            }
+        }
         createNotificationChannel();
     }
+
+    private final SensorEventListener stepListener = new SensorEventListener() {
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+            if (event.values != null && event.values.length > 0) {
+                lifetimeStepsSnapshot = (long) event.values[0];
+            }
+        }
+
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {
+            // no-op
+        }
+    };
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -128,6 +195,13 @@ public class TrackerService extends Service {
     public void onDestroy() {
         super.onDestroy();
         handler.removeCallbacks(poller);
+        if (sensorManager != null && stepCounter != null) {
+            try {
+                sensorManager.unregisterListener(stepListener);
+            } catch (Throwable t) {
+                // ignore
+            }
+        }
         Log.i(TAG, "TrackerService stopped");
     }
 
@@ -312,11 +386,185 @@ public class TrackerService extends Service {
             return;
         }
         lastFireMs.put(key, now);
-        new Thread(() -> postTrigger(triggerValue, appPkg, totalMs)).start();
+        // 디바이스 status snapshot — postTrigger 안에서 다시 캡쳐하면 워커
+        // 스레드에서 system service 접근이 어색해질 수 있어 메인 스레드에서 먼저.
+        final boolean dndActive = isDndActive();
+        final boolean charging = isCharging();
+        final boolean screenOn = (pm != null) && pm.isInteractive();
+        final long stepsToday = getStepsToday();
+        final boolean headphones = isHeadphonesConnected();
+        final String placeCategory = matchPlaceCategory();   // null·"home"·"other" 등
+        new Thread(() ->
+            postTrigger(triggerValue, appPkg, totalMs,
+                    dndActive, charging, screenOn, stepsToday, headphones,
+                    placeCategory)
+        ).start();
+    }
+
+    // ============================================================ 디바이스 상태 캡쳐
+    private boolean isDndActive() {
+        // DND(방해 금지) 활성 = INTERRUPTION_FILTER_NONE/ALARMS/PRIORITY.
+        // INTERRUPTION_FILTER_ALL 만 "모두 허용" (DND off).
+        try {
+            NotificationManager nm = getSystemService(NotificationManager.class);
+            if (nm == null) return false;
+            int filter = nm.getCurrentInterruptionFilter();
+            return filter != NotificationManager.INTERRUPTION_FILTER_ALL
+                    && filter != NotificationManager.INTERRUPTION_FILTER_UNKNOWN;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private boolean isCharging() {
+        try {
+            IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+            Intent battery = registerReceiver(null, ifilter);
+            if (battery == null) return false;
+            int status = battery.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+            return status == BatteryManager.BATTERY_STATUS_CHARGING
+                    || status == BatteryManager.BATTERY_STATUS_FULL;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** 자정 마커와 비교한 '오늘 걸음 수'. 권한 거부·센서 없음 시 -1. */
+    private long getStepsToday() {
+        if (stepCounter == null) return -1L;
+        long current = lifetimeStepsSnapshot;
+        if (current < 0) return -1L;
+        Calendar cal = Calendar.getInstance();
+        int today = cal.get(Calendar.DAY_OF_YEAR);
+        if (today != midnightDayOfYear) {
+            midnightStepsMark = current;
+            midnightDayOfYear = today;
+        }
+        long today_steps = current - midnightStepsMark;
+        return today_steps < 0 ? 0 : today_steps;
+    }
+
+    /** 가장 최근 위치를 등록 장소들과 매칭 → 라벨 또는 "other". 권한 없음·위치
+     * 끔 시 null (페이로드 omit). 정확 좌표는 백엔드로 보내지 않는다. */
+    private String matchPlaceCategory() {
+        if (locationManager == null) return null;
+        // PROVIDER 우선순위: NETWORK (배터리 친화) → GPS
+        Location best = null;
+        try {
+            if (checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION)
+                    == PackageManager.PERMISSION_GRANTED) {
+                Location net = null;
+                Location gps = null;
+                try {
+                    net = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+                } catch (Throwable ignored) {}
+                try {
+                    gps = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+                } catch (Throwable ignored) {}
+                // 더 최신 + 정확도 좋은 거 선택
+                if (gps != null && (net == null || gps.getTime() > net.getTime())) {
+                    best = gps;
+                } else {
+                    best = net;
+                }
+            }
+        } catch (Throwable t) {
+            return null;
+        }
+        if (best == null) return null;
+
+        // 1시간 이상 묵은 위치는 신뢰도 ↓ — 무시
+        if (System.currentTimeMillis() - best.getTime() > 3600_000L) return null;
+
+        double bestDist = Double.MAX_VALUE;
+        String bestLabel = null;
+        for (int i = 0; i < cachedPlaces.length(); i++) {
+            JSONObject p = cachedPlaces.optJSONObject(i);
+            if (p == null) continue;
+            double lat = p.optDouble("lat", Double.NaN);
+            double lng = p.optDouble("lng", Double.NaN);
+            int radius = p.optInt("radius_m", 200);
+            if (Double.isNaN(lat) || Double.isNaN(lng)) continue;
+            // 짧은 거리 — 위·경도 차이 m 변환 후 피타고라스. (위도 1° ≈ 111km,
+            // 경도는 위도에 따라 cos 보정).
+            double dLat = (best.getLatitude() - lat) * 111_000.0;
+            double avgLat = Math.toRadians((best.getLatitude() + lat) / 2.0);
+            double dLng = (best.getLongitude() - lng) * 111_000.0 * Math.cos(avgLat);
+            double dist = Math.sqrt(dLat * dLat + dLng * dLng);
+            if (dist <= radius && dist < bestDist) {
+                bestDist = dist;
+                bestLabel = p.optString("label", null);
+            }
+        }
+        return bestLabel != null ? bestLabel : "other";
+    }
+
+    /** 백엔드에서 등록된 장소 목록 fetch. 실패해도 기존 캐시 유지. */
+    private void fetchPlacesIfStale() {
+        if (System.currentTimeMillis() - placesFetchedAt < PLACES_FETCH_INTERVAL_MS) {
+            return;
+        }
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(BuildConfig.NAGGING_COACH_URL + "/places");
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty(
+                    "Authorization", "Bearer " + BuildConfig.TRIGGER_SECRET);
+            conn.setConnectTimeout(10_000);
+            conn.setReadTimeout(10_000);
+            if (conn.getResponseCode() != 200) return;
+            try (InputStream is = conn.getInputStream()) {
+                byte[] buf = new byte[4096];
+                StringBuilder sb = new StringBuilder();
+                int n;
+                while ((n = is.read(buf)) > 0) {
+                    sb.append(new String(buf, 0, n, StandardCharsets.UTF_8));
+                }
+                JSONObject obj = (JSONObject) new JSONTokener(sb.toString()).nextValue();
+                JSONArray arr = obj.optJSONArray("places");
+                if (arr != null) {
+                    cachedPlaces = arr;
+                    placesFetchedAt = System.currentTimeMillis();
+                    Log.i(TAG, "places fetched: " + arr.length() + " entries");
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "places fetch failed (keep cache)", t);
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    /** 블루투스 헤드셋·A2DP·유선·USB 헤드폰 등 외장 오디오 출력 연결 여부. */
+    private boolean isHeadphonesConnected() {
+        if (audioManager == null) return false;
+        try {
+            AudioDeviceInfo[] devices =
+                    audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS);
+            if (devices == null) return false;
+            for (AudioDeviceInfo d : devices) {
+                int type = d.getType();
+                if (type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+                        || type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                        || type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES
+                        || type == AudioDeviceInfo.TYPE_WIRED_HEADSET
+                        || type == AudioDeviceInfo.TYPE_USB_HEADSET) {
+                    return true;
+                }
+            }
+        } catch (Throwable t) {
+            // ignore
+        }
+        return false;
     }
 
     // =========================================================== HTTP
-    private void postTrigger(String triggerValue, String appPkg, long totalMs) {
+    private void postTrigger(
+            String triggerValue, String appPkg, long totalMs,
+            boolean dndActive, boolean charging, boolean screenOn,
+            long stepsToday, boolean headphones,
+            String placeCategory) {
         HttpURLConnection conn = null;
         try {
             URL url = new URL(BuildConfig.NAGGING_COACH_URL + "/trigger");
@@ -331,18 +579,27 @@ public class TrackerService extends Service {
             conn.setReadTimeout(20_000);
 
             int sessionMinutes = (int) (totalMs / 60_000L);
-            // OS 에 등록된 앱 표시 이름 (한국어 OS면 한글). phone-screen 같은
-            // 가상 라벨은 패키지매니저에 없어서 그대로 통과.
             String label = appPkg.contains(".") ? getAppLabel(appPkg) : appPkg;
+            StringBuilder snap = new StringBuilder();
+            snap.append("\"active_window\":\"").append(escapeJson(label)).append("\",");
+            snap.append("\"idle_time\":0,");
+            snap.append("\"switch_count\":0,");
+            snap.append("\"session_minutes\":").append(sessionMinutes).append(",");
+            snap.append("\"dnd_active\":").append(dndActive).append(",");
+            snap.append("\"charging\":").append(charging).append(",");
+            snap.append("\"screen_on\":").append(screenOn);
+            if (stepsToday >= 0) {
+                snap.append(",\"steps_today\":").append(stepsToday);
+            }
+            snap.append(",\"headphones_connected\":").append(headphones);
+            if (placeCategory != null) {
+                snap.append(",\"place_category\":\"")
+                    .append(escapeJson(placeCategory)).append("\"");
+            }
             String body = "{"
                     + "\"trigger\":\"" + escapeJson(triggerValue) + "\","
                     + "\"device\":\"phone\","
-                    + "\"snapshot\":{"
-                    + "\"active_window\":\"" + escapeJson(label) + "\","
-                    + "\"idle_time\":0,"
-                    + "\"switch_count\":0,"
-                    + "\"session_minutes\":" + sessionMinutes
-                    + "}}";
+                    + "\"snapshot\":{" + snap + "}}";
 
             try (OutputStream os = conn.getOutputStream()) {
                 os.write(body.getBytes(StandardCharsets.UTF_8));

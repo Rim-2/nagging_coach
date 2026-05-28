@@ -91,6 +91,7 @@ _HELP_TEXT = (
     "/export — 내 데이터 (목표·습관·일정·통계) 한 번에 보기\n"
     "/reset — 대화·목표·습관·일정 다 비우기 (설정·통계는 유지)\n"
     "/reset all — 통계·설정·약점 학습까지 전부 비우기 (처음 만난 상태로)\n"
+    "/place 라벨 — 장소 등록 (다음 5분 안에 위치 메시지)\n"
 )
 # 그 외 자동 복구·루프 관련 상수는 mixin 모듈로 분리:
 #   - 텔레그램 연속 실패 시 컨테이너 자살: app_messaging (TG_FAILURE_EXIT_THRESHOLD)
@@ -244,9 +245,10 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
         text = (message.get("text") or "").strip()
         caption = (message.get("caption") or "").strip()
         photo = message.get("photo")
+        location = message.get("location")
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
-        if chat_id is None or (not text and not photo):
+        if chat_id is None or (not text and not photo and not location):
             return
 
         if text.startswith("/start"):
@@ -282,6 +284,15 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
 
         if text.startswith("/export"):
             self._send(chat_id, self._build_export())
+            return
+
+        # 위치 메시지 — `/place 라벨` 직후 5분 안이면 등록, 아니면 안내.
+        if location:
+            self._handle_location_message(chat_id, location)
+            return
+
+        if text.startswith("/place"):
+            self._handle_place_command(chat_id, text)
             return
 
         if text.startswith("/reset"):
@@ -328,6 +339,63 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
             self._handle_photo(chat_id, photo, caption)
             return
         self._handle_chat(chat_id, text)
+
+    # ============================================== 장소 라벨 등록
+    _PLACE_HELP = (
+        "📍 장소 등록 사용법\n"
+        "/place 라벨 — 다음 5분 안에 텔레그램에서 '내 위치' 메시지를 보내면 "
+        "그 좌표를 그 라벨로 등록. 폰 위성이 자동으로 카테고리 인식.\n"
+        "/place list — 등록된 장소 목록\n"
+        "/place remove 라벨 — 등록 삭제\n"
+        "예: /place 집  → 위치 메시지 보내기 → '집' 등록"
+    )
+
+    def _handle_place_command(self, chat_id: int, text: str) -> None:
+        body = text[len("/place"):].strip()
+        if not body:
+            self._send(chat_id, self._PLACE_HELP)
+            return
+        if body == "list":
+            places = self._store.places
+            if not places:
+                self._send(chat_id, "📍 등록된 장소가 아직 없어. /place 라벨 로 시작.")
+                return
+            lines = [f"  • {p['label']} (반경 {p.get('radius_m', 200)}m)" for p in places]
+            self._send(chat_id, "📍 등록된 장소:\n" + "\n".join(lines))
+            return
+        if body.startswith("remove "):
+            label = body[len("remove "):].strip()
+            if self._store.remove_place(label):
+                self._send(chat_id, f"📍 '{label}' 삭제했어.")
+            else:
+                self._send(chat_id, f"'{label}' 등록 안 돼있어.")
+            return
+        # 라벨만 들어온 경우 → 위치 메시지 펜딩
+        self._store.begin_place_registration(body)
+        self._send(
+            chat_id,
+            f"📍 '{body}' 라벨로 등록할 거야. 5분 안에 *내 위치* 메시지를 보내줘 "
+            "(텔레그램 첨부 메뉴 → 위치 → 내 위치 보내기).",
+        )
+
+    def _handle_location_message(self, chat_id: int, location: dict) -> None:
+        try:
+            lat = float(location.get("latitude"))
+            lng = float(location.get("longitude"))
+        except (TypeError, ValueError):
+            self._send(chat_id, "좌표를 못 읽었어. 다시 보내줄래?")
+            return
+        label = self._store.consume_pending_place_label()
+        if label is None:
+            self._send(
+                chat_id,
+                "📍 위치는 받았는데 어디로 라벨링할지 모르겠어. "
+                "먼저 `/place 라벨` 을 보내고 5분 안에 위치를 보내줘.",
+            )
+            return
+        self._store.add_place(label, lat, lng)
+        self._send(chat_id, f"📍 '{label}' 등록 완료! 이제 폰 위성이 자동으로 인식해.")
+        print(f"[App] 장소 등록: {label} ({lat:.5f}, {lng:.5f})")
 
     # ============================================== inline keyboard 콜백
     # callback_data 포맷: "namespace:value". 현재 등록된 네임스페이스:
