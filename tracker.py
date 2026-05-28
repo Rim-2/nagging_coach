@@ -22,8 +22,17 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Callable, Deque, Dict, Optional, Tuple
 
-import pygetwindow as gw
-from pynput import keyboard, mouse
+# PC 활동 감시용 OS 의존 패키지 — Linux 헤드리스 컨테이너(Railway 백엔드) 등에는
+# 설치되어 있지 않다. import 자체는 가드로 살리되, 실제 OS 호출은 Tracker
+# 인스턴스화 시점에 자연스럽게 실패한다 (헤드리스에선 어차피 인스턴스 안 만듦).
+# 이렇게 두면 ENUM·dataclass·유틸 함수만 import 하는 경로는 깨지지 않는다.
+try:
+    import pygetwindow as gw   # type: ignore[import-not-found]
+    from pynput import keyboard, mouse   # type: ignore[import-not-found]
+except ImportError:
+    gw = None                  # type: ignore[assignment]
+    keyboard = None            # type: ignore[assignment]
+    mouse = None               # type: ignore[assignment]
 
 
 class State(Enum):
