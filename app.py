@@ -71,6 +71,7 @@ REMINDER_LEAD_MIN = 15.0          # 캘린더 일정 N분 전에 리마인드
 REMINDER_CHECK_INTERVAL = 120.0   # 일정 리마인더 점검 주기
 REMINDER_GRACE_SEC = 600.0        # 폴링 miss·재시작으로 늦은 알림 — N초 안이면 발사 (10분)
 ALARM_ONCE_MAX_RETRY = 3          # once 알람 발송 실패 시 최대 재시도 횟수
+RESET_CONFIRM_TTL = 60.0          # /reset 첫 명령 후 N초 안에 한 번 더 보내야 실행
 
 
 _HELP_TEXT = (
@@ -241,6 +242,9 @@ class CoachApp:
         self._ignored_nags = 0               # 연속으로 무시당한 잔소리 횟수
         self._remote_cooldowns: dict[str, float] = {}  # trigger_value → 다음 발동 가능 시각
         self._remote_cooldown_lock = threading.Lock()
+        # /reset 확인 쿠션 — 첫 명령은 안내 메시지, 60초 안에 같은 명령 한 번 더
+        # 받아야 실제 실행. 사용자 사고 방지용. None 또는 {"kind", "at"}.
+        self._pending_reset: Optional[dict] = None
         # 최근 트리거 이력 (복합 트리거 룰 평가용). 메모리 deque, 봇 재시작 시 리셋.
         # 항목: {"device": "pc"|"phone", "trigger": str, "at": float}
         from collections import deque
@@ -356,6 +360,14 @@ class CoachApp:
         if chat_id != registered:
             return  # 1인용 봇 — 등록된 사용자만 응대
 
+        # /reset 펜딩 자동 취소 — 사용자가 같은 명령을 다시 보내지 않고 다른
+        # 메시지를 보내면 그 자체가 '취소' 의도. 짧게 알려주고 흐름 이어감.
+        if self._pending_reset is not None and not text.startswith("/reset"):
+            kind = self._pending_reset.get("kind")
+            self._pending_reset = None
+            cmd = "/reset all" if kind == "hard" else "/reset"
+            self._send(chat_id, f"({cmd} 취소 — 다른 메시지를 받았어)")
+
         if text.startswith("/help"):
             self._send(chat_id, _HELP_TEXT)
             return
@@ -367,15 +379,40 @@ class CoachApp:
         if text.startswith("/reset"):
             # `/reset all` 은 통계·설정·자기학습까지 전부 비움 — 위험 작업이라
             # 명시 인자 필수. `/reset` 만 쓰면 기존 동작 (대화·목표·습관만).
+            # 두 단계 확인: 첫 명령은 안내, 60초 안에 같은 명령 한 번 더 받아야 실행.
             hard = text.strip().lower() in ("/reset all", "/reset hard", "/resetall")
-            self._agent.reset(hard=hard)
-            if hard:
-                msg = (
-                    "전부 초기화했어 — 통계·설정·약점 학습까지 다 비웠어. "
-                    "처음 만난 것처럼 시작하자."
-                )
+            kind = "hard" if hard else "soft"
+            now = time.time()
+            pending = self._pending_reset
+            confirmed = (
+                pending is not None
+                and pending.get("kind") == kind
+                and (now - float(pending.get("at", 0.0))) < RESET_CONFIRM_TTL
+            )
+            if confirmed:
+                self._pending_reset = None
+                self._agent.reset(hard=hard)
+                if hard:
+                    msg = (
+                        "전부 초기화했어 — 통계·설정·약점 학습까지 다 비웠어. "
+                        "처음 만난 것처럼 시작하자."
+                    )
+                else:
+                    msg = "기억 싹 비웠어. 자, 다시 시작하자 — 오늘 뭐 할 거야?"
             else:
-                msg = "기억 싹 비웠어. 자, 다시 시작하자 — 오늘 뭐 할 거야?"
+                self._pending_reset = {"kind": kind, "at": now}
+                if hard:
+                    msg = (
+                        "⚠️ 정말 *전부* 비우려고? 통계·설정·약점 학습까지 다 날아가. "
+                        "확실하면 60초 안에 `/reset all` 을 한 번 더 보내. "
+                        "그 사이에 다른 메시지를 보내면 자동 취소돼."
+                    )
+                else:
+                    msg = (
+                        "정말 비울거야? 대화·목표·습관·일정이 사라져 "
+                        "(설정·통계는 유지). 확실하면 60초 안에 `/reset` 을 "
+                        "한 번 더 보내. 다른 메시지를 보내면 자동 취소돼."
+                    )
             self._send(chat_id, msg)
             return
 
