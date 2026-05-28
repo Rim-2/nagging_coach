@@ -552,6 +552,35 @@ class CoachAgent:
             )
             return self._turn(prompt)
 
+    def daily_journal(self) -> str:
+        """매일 정해진 시간에 사용자에게 한 줄 회고를 유도. 부담 없이 한 문장,
+        강요하지 않는 톤. 사용자가 답하면 EXTRACT 가 mood·note 로 자동 기록."""
+        with self._lock:
+            # 오늘 활동 컨텍스트를 짧게 — 답하기 좋은 단서.
+            buckets = self._store.daily_stats
+            today = datetime.date.today().isoformat()
+            today_b = buckets.get(today) or {}
+            gc = today_b.get("goals_completed", 0)
+            hd = today_b.get("habit_dones", 0)
+            tt = sum((today_b.get("triggers") or {}).values())
+            ctx_bits = []
+            if gc:
+                ctx_bits.append(f"목표 {gc}개 완료")
+            if hd:
+                ctx_bits.append(f"습관 {hd}회")
+            if tt:
+                ctx_bits.append(f"잔소리 {tt}회")
+            ctx = (", ".join(ctx_bits)) if ctx_bits else "기록 거의 없음"
+            prompt = (
+                "[자동 트리거] 하루 마무리 시간이야. 사용자에게 한 줄로 "
+                "'오늘 어땠어?' 같은 가벼운 회고를 유도해 — 강요 X, 압박 X. "
+                "한 문장이면 충분하다는 신호도 줘. "
+                f"오늘 활동 요약 (참고용, 사용자한테 그대로 옮기지는 마): {ctx}. "
+                "사용자가 답하면 mood·기분이 자동 기록되니, 추후 회고에 활용된다는 "
+                "안내는 굳이 하지 마."
+            )
+            return self._turn(prompt)
+
     def risk_predict(self, target_hour: int, top_trigger_label: str, fire_count: int) -> str:
         """위험 예측 선제 알림. 과거 패턴상 target_hour 시간대에 자주 잡혔다는
         걸 사용자에게 *직전*에 살짝 짚어준다. 다그치지 않고 자기인식을 거든다.

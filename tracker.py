@@ -41,6 +41,7 @@ class TriggerType(Enum):
     LATE_NIGHT = "늦은 밤"
     OVERWORK = "휴식 없는 과로"
     PERSONAL_WEAKNESS = "개인 약점 앱"
+    POMODORO_BREAK = "Pomodoro 휴식"
 
 
 ENTERTAINMENT_KEYWORDS = (
@@ -281,6 +282,7 @@ class Tracker:
     LATE_NIGHT_START_HOUR = 1          # 새벽 1시 ~ 5시 사이를 '늦은 밤'으로
     LATE_NIGHT_END_HOUR = 5
     OVERWORK_DURATION = 7200.0         # 휴식 없이 2시간 연속 → 과로
+    POMODORO_DURATION = 3000.0         # 50분 연속 작업 → 짧은 휴식 권유 (Pomodoro)
     BREAK_IDLE_SEC = 300.0             # 5분 이상 유휴 = '쉬는 중'으로 인정
     WEAKNESS_DWELL_SEC = 180.0         # 개인 약점 앱에 3분 → 빠른 경고
 
@@ -309,6 +311,10 @@ class Tracker:
         self._scroll_started: Optional[float] = None
         self._continuous_since: Optional[float] = None
         self._weakness_started: Optional[float] = None
+        # Pomodoro 휴식 — 50분 연속 작업 시 한 번 발사 (한 세션에 1회).
+        # idle 5분 이상 가지면 카운터 리셋 + _pomodoro_fired 해제.
+        self._pomodoro_started: Optional[float] = None
+        self._pomodoro_fired: bool = False
         self._late_night_fired_on: Optional[datetime.date] = None
         self._cooldown_until: float = 0.0
 
@@ -347,6 +353,8 @@ class Tracker:
             self._scroll_started = None
             self._continuous_since = None
             self._weakness_started = None
+            self._pomodoro_started = None
+            self._pomodoro_fired = False
 
     def wake(self) -> None:
         """Sleep → Normal 복귀 — 목표 완료 후 새 목표를 잡았을 때 호출.
@@ -360,6 +368,8 @@ class Tracker:
             self._scroll_started = None
             self._continuous_since = None
             self._weakness_started = None
+            self._pomodoro_started = None
+            self._pomodoro_fired = False
 
     @property
     def state(self) -> State:
@@ -577,6 +587,22 @@ class Tracker:
                 return TriggerType.PERSONAL_WEAKNESS
         else:
             self._weakness_started = None
+
+        # Trigger 9: Pomodoro 휴식 — 50분 연속 작업 시 1회 권유 (한 세션 1회).
+        # idle 5분 이상 시 카운터 리셋 + _pomodoro_fired 해제 → 다음 세션에 또.
+        # 과로(120분) 와 별개 — 짧은 사이클의 가벼운 휴식 권유.
+        if snap.idle_time >= self.BREAK_IDLE_SEC:
+            self._pomodoro_started = None
+            self._pomodoro_fired = False
+        else:
+            if self._pomodoro_started is None:
+                self._pomodoro_started = time.time()
+            elif (
+                not self._pomodoro_fired
+                and (time.time() - self._pomodoro_started) >= self.POMODORO_DURATION
+            ):
+                self._pomodoro_fired = True   # 한 세션에 한 번만
+                return TriggerType.POMODORO_BREAK
 
         # Trigger 8: 휴식 없는 과로 — 5분 이상 쉬는 틈 없이 2시간 연속
         if snap.idle_time >= self.BREAK_IDLE_SEC:

@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 
 from agent_tools import FOCUS_END_MARKER
 from ai_engine import AIGenerationError, CoachAgent
+from app_http import PHONE_APP_LABELS, HttpServerMixin
 from calendar_client import CalendarClient
 from store import Store
 from telegram_client import TelegramClient
@@ -72,6 +73,8 @@ REMINDER_CHECK_INTERVAL = 120.0   # 일정 리마인더 점검 주기
 REMINDER_GRACE_SEC = 600.0        # 폴링 miss·재시작으로 늦은 알림 — N초 안이면 발사 (10분)
 ALARM_ONCE_MAX_RETRY = 3          # once 알람 발송 실패 시 최대 재시도 횟수
 RESET_CONFIRM_TTL = 60.0          # /reset 첫 명령 후 N초 안에 한 번 더 보내야 실행
+DAILY_JOURNAL_HOUR = 22           # 매일 N시에 하루 마무리 일지 발사
+DAILY_JOURNAL_CHECK_INTERVAL = 300.0  # 슬롯 놓치지 않게 5분 폴링
 CHAT_DEBOUNCE_SEC = 1.5           # 사용자 chat 짧은 간격 우다다 → 묶어서 한 번에 답장
 
 
@@ -118,100 +121,7 @@ DAILY_RESTART_CHECK_INTERVAL = 300.0  # 5분 주기로 시각 체크
 # 수 있음. 같은 트리거 종류는 클라우드가 권위 있게 N분 막아 잔소리 폭주를 차단.
 REMOTE_TRIGGER_COOLDOWN_SEC = 600.0
 
-# 폰 위성이 보내는 Android 패키지명을 사람이 읽는 라벨로. 매핑에 없으면 그대로.
-_PHONE_APP_LABELS = {
-    "com.instagram.android": "인스타그램",
-    "com.google.android.youtube": "유튜브",
-    "com.zhiliaoapp.musically": "틱톡",
-    "com.ss.android.ugc.trill": "틱톡",
-    "com.facebook.katana": "페이스북",
-    "com.twitter.android": "X(트위터)",
-    "com.reddit.frontpage": "레딧",
-    "com.snapchat.android": "스냅챗",
-    "com.kakao.talk": "카카오톡",
-    "com.discord": "디스코드",
-    "com.nhn.android.band": "밴드",
-    "com.linecorp.linelite": "라인",
-    "phone-screen": "휴대폰",
-}
-
-
-class _TriggerHTTPHandler(http.server.BaseHTTPRequestHandler):
-    """원격 PC 트래커 위성(trigger_satellite.py)에서 보내는 트리거를 받는
-    미니 HTTP 핸들러. Bearer 토큰으로 인증하고, 검증된 요청만 CoachApp.
-    handle_remote_trigger 로 위임한다.
-
-    같은 봇 토큰으로 두 인스턴스가 텔레그램 폴링을 동시에 하면 409 충돌이
-    나기 때문에, '클라우드 24/7 봇 + 로컬 PC 감시'를 같이 운영하려면 로컬은
-    텔레그램에 손대지 않고 트리거만 여기로 쏴야 한다."""
-
-    # 서브클래스 팩토리(_start_http_server)에서 주입된다.
-    coach_app: Optional["CoachApp"] = None
-    trigger_secret: str = ""
-
-    def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler 인터페이스
-        if self.path != "/trigger":
-            self._respond(404, {"ok": False, "error": "not found"})
-            return
-        if not self.trigger_secret:
-            self._respond(503, {"ok": False, "error": "secret not configured"})
-            return
-        if self.headers.get("Authorization", "") != f"Bearer {self.trigger_secret}":
-            self._respond(401, {"ok": False, "error": "unauthorized"})
-            return
-        length = int(self.headers.get("Content-Length") or 0)
-        try:
-            raw = self.rfile.read(length) if length > 0 else b"{}"
-            body = json.loads(raw.decode("utf-8") or "{}")
-        except Exception as exc:
-            self._respond(400, {"ok": False, "error": f"bad json: {exc}"})
-            return
-        try:
-            result = self.coach_app.handle_remote_trigger(body)
-        except Exception as exc:
-            print(f"[App] 원격 트리거 처리 오류: {exc}")
-            self._respond(500, {"ok": False, "error": "internal"})
-            return
-        self._respond(200, result)
-
-    def do_GET(self) -> None:  # noqa: N802
-        # 외부에서 curl 로 살아있는지 찔러볼 수 있는 헬스체크용 엔드포인트.
-        if self.path in ("/", "/health"):
-            self._respond(200, {"ok": True, "service": "nagging_coach"})
-            return
-        # 위성이 백엔드의 학습된 약점 키워드를 주기적으로 fetch — Bearer 인증 필수
-        # (헬스체크는 인증 없이, 데이터는 인증 후).
-        if self.path == "/weak_spots":
-            if not self.trigger_secret:
-                self._respond(503, {"ok": False, "error": "secret not configured"})
-                return
-            if self.headers.get("Authorization", "") != f"Bearer {self.trigger_secret}":
-                self._respond(401, {"ok": False, "error": "unauthorized"})
-                return
-            try:
-                items = list(self.coach_app._store.weak_spots)
-            except Exception as exc:
-                print(f"[App] /weak_spots 조회 오류: {exc}")
-                self._respond(500, {"ok": False, "error": "internal"})
-                return
-            self._respond(200, {"ok": True, "weak_spots": items})
-            return
-        self._respond(404, {"ok": False, "error": "not found"})
-
-    def log_message(self, format, *args) -> None:  # noqa: A002
-        # 기본 access log 는 stderr 로 시끄러움 — 우리 print 만 남긴다.
-        return
-
-    def _respond(self, code: int, payload: dict) -> None:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-
-class CoachApp:
+class CoachApp(HttpServerMixin):
     def __init__(self) -> None:
         token = os.getenv("TELEGRAM_BOT_TOKEN")
         if not token:
@@ -256,6 +166,8 @@ class CoachApp:
         self._chat_buffer: List[str] = []
         self._chat_buffer_lock = threading.Lock()
         self._chat_debounce_timer: Optional[threading.Timer] = None
+        # retry 큐 모니터링 — 임계 초과 시 시스템 알림, 쿨다운으로 도배 방지
+        self._last_retry_queue_alert: float = 0.0
 
     @staticmethod
     def _init_calendar() -> Optional[CalendarClient]:
@@ -321,6 +233,9 @@ class CoachApp:
         ).start()
         threading.Thread(
             target=self._risk_predict_loop, name="RiskPredict", daemon=True
+        ).start()
+        threading.Thread(
+            target=self._daily_journal_loop, name="DailyJournal", daemon=True
         ).start()
         self._start_http_server()
 
@@ -684,7 +599,7 @@ class CoachApp:
         raw_win = snap.get("active_window") or "(알 수 없는 창)"
         # 폰 위성이 보낸 Android 패키지명이면 사람이 읽는 이름으로 (PC 의 sanitize
         # 라벨이나 raw 창 제목은 그대로 통과).
-        win = _PHONE_APP_LABELS.get(raw_win, raw_win)
+        win = PHONE_APP_LABELS.get(raw_win, raw_win)
         idle_min = int((snap.get("idle_time") or 0) // 60)
         switch_count = snap.get("switch_count") or 0
         # 폰 위성은 실제 세션 분을 보냄. PC 위성은 안 보냄 → None.
@@ -703,6 +618,13 @@ class CoachApp:
             return (
                 f"사용자가 {mins}분 넘게 쉬는 틈도 없이 계속 화면 앞에 붙어 있어. "
                 "눈도 몸도 지칠 텐데 — 잠깐 쉬라고 챙겨줘."
+            )
+        if trigger_value == "Pomodoro 휴식":
+            # 한 세션 첫 50분 — 짧은 환기 권유. 다그치지 말고 가볍게.
+            return (
+                "사용자가 50분 가까이 한 흐름으로 작업했어. Pomodoro 식으로 "
+                "5~10분 가볍게 환기하라고 권해 — 다그치지 말고 '한 사이클 끝났네, "
+                "잠깐 일어나서 물 한 모금?' 같이 부드러운 톤. 강요 X."
             )
 
         goal_note = (
@@ -1261,6 +1183,10 @@ class CoachApp:
     _RETRY_BACKOFF_MIN = (1, 2, 4, 8, 16, 30)
     _RETRY_CHECK_INTERVAL = 30.0   # 큐 폴링 주기 (초)
     _RETRY_MAX_AGE_SEC = 7 * 24 * 3600.0  # 일주일 지나도 못 보내면 폐기
+    # 큐 모니터링 — 임계치 넘으면 사용자에게 1회 시스템 메시지 (다시 풀릴 때까지 X)
+    _RETRY_QUEUE_ALERT_SIZE = 5            # 동시에 N개 이상 큐에 있으면 경고
+    _RETRY_QUEUE_ALERT_AGE_SEC = 3600.0    # 가장 오래된 항목이 N초 이상이면 경고
+    _RETRY_QUEUE_ALERT_COOLDOWN = 3 * 3600.0  # 같은 경고 N초 안에 또 보내지 않음
 
     def _retry_backoff_sec(self, attempts: int) -> float:
         idx = min(attempts, len(self._RETRY_BACKOFF_MIN) - 1)
@@ -1323,33 +1249,44 @@ class CoachApp:
                     )
                 # 한 사이클에 한 메시지씩만 — Telegram API rate-limit 회피
                 break
+            # 큐가 과하게 쌓이면 사용자에게 시스템 알림 (Telegram 장기 장애 등 감지)
+            self._maybe_alert_retry_queue(pending, now)
 
-    # ============================================== 원격 트리거 HTTP 서버
-    def _start_http_server(self) -> None:
-        """원격 트리거 HTTP 서버를 데몬 스레드로 띄운다. TRIGGER_SECRET 이
-        설정돼 있을 때만 활성 — 시크릿 없이 띄우면 누구나 트리거를 발사할 수
-        있으므로 안전을 위해 비활성. PORT 환경변수는 Railway 가 자동 주입한다."""
-        secret = os.getenv("TRIGGER_SECRET", "").strip()
-        if not secret:
-            print("[App] TRIGGER_SECRET 미설정 — 원격 트리거 endpoint 비활성")
+    def _maybe_alert_retry_queue(self, pending: list, now: float) -> None:
+        """큐 크기 또는 가장 오래된 항목 age 가 임계 초과 시 1회 알림.
+        같은 알림은 _RETRY_QUEUE_ALERT_COOLDOWN 동안 다시 보내지 않는다."""
+        if not pending:
             return
-        port = int(os.getenv("PORT", "8080"))
-        handler_cls = type(
-            "TriggerHandler",
-            (_TriggerHTTPHandler,),
-            {"coach_app": self, "trigger_secret": secret},
+        chat_id = self._store.chat_id
+        if chat_id is None:
+            return
+        if now - self._last_retry_queue_alert < self._RETRY_QUEUE_ALERT_COOLDOWN:
+            return
+        size_alert = len(pending) >= self._RETRY_QUEUE_ALERT_SIZE
+        oldest_age = now - min(float(it.get("created_at", now)) for it in pending)
+        age_alert = oldest_age >= self._RETRY_QUEUE_ALERT_AGE_SEC
+        if not (size_alert or age_alert):
+            return
+        reasons = []
+        if size_alert:
+            reasons.append(f"큐에 {len(pending)}개 누적")
+        if age_alert:
+            reasons.append(f"가장 오래된 항목 {int(oldest_age / 60)}분째 미도달")
+        msg = (
+            "(시스템) 텔레그램 발송 retry 큐가 막혀 있어 — "
+            + ", ".join(reasons)
+            + ". 네트워크나 봇 토큰을 확인해줘. 큐가 풀리는 대로 누적된 잔소리가 한꺼번에 도착할 수 있어."
         )
+        # _send 는 retry 큐가 도와주는 wrapper. 이 알림 자체가 전송 실패하면
+        # 또 큐에 들어가도 의미 없으니 raw send_message 로 한 번만 시도.
         try:
-            server = http.server.ThreadingHTTPServer(
-                ("0.0.0.0", port), handler_cls
-            )
+            self._tg.send_message(chat_id, msg)
         except Exception as exc:
-            print(f"[App] HTTP 서버 시작 실패 (포트 {port}): {exc}")
-            return
-        threading.Thread(
-            target=server.serve_forever, name="TriggerHTTP", daemon=True
-        ).start()
-        print(f"[App] 원격 트리거 HTTP 서버 시작 — 포트 {port}, POST /trigger")
+            print(f"[App] retry 큐 경고 전송 실패: {exc}")
+        self._last_retry_queue_alert = now
+        print(f"[App] retry 큐 경고 알림: {reasons}")
+
+    # _start_http_server / TriggerHTTPHandler 는 app_http.HttpServerMixin 으로 분리됨.
 
     # ====================================================== 위험 시간대 예측
     # 시간대 매핑 결과를 바탕으로 다음 위험 시간 *직전*에 1일 1회 선제 알림.
@@ -1401,6 +1338,30 @@ class CoachApp:
             print(f"[App] 위험 예측 발송: {target[0]}시 ({target[1]}회 누적)")
             self._send_or_enqueue(chat_id, reply, kind="risk_predict")
             self._store.mark_risk_predict_fired(target[0])
+
+    # ===================================================== 하루 마무리 일지
+    def _daily_journal_loop(self) -> None:
+        """매일 정해진 시간(DAILY_JOURNAL_HOUR)에 한 줄 회고 유도 메시지 발사.
+        같은 날 중복 발송 가드 + retry 큐가 도달 책임짐. 사용자가 답하면
+        EXTRACT 가 mood/note 로 자동 기록."""
+        while not self._stop.wait(DAILY_JOURNAL_CHECK_INTERVAL):
+            chat_id = self._store.chat_id
+            if chat_id is None:
+                continue
+            now = datetime.datetime.now()
+            if now.hour != DAILY_JOURNAL_HOUR:
+                continue
+            today_s = now.date().isoformat()
+            if self._store.last_daily_journal == today_s:
+                continue
+            try:
+                reply = self._agent.daily_journal()
+            except AIGenerationError as exc:
+                print(f"[App] 하루 마무리 일지 생성 실패: {exc}")
+                continue
+            print("[App] 하루 마무리 일지 발송")
+            self._store.last_daily_journal = today_s  # 발사 시도 시점에 마크
+            self._send_or_enqueue(chat_id, reply, kind="daily_journal")
 
     # ====================================================== 주간 회고
     def _weekly_review_loop(self) -> None:

@@ -109,6 +109,7 @@ class Store:
             "last_overload_checkin": None,
             "last_late_night_fired": None,  # YYYY-MM-DD — 하루 한 번 제약 영속화
             "last_risk_predict": None,      # {"date": YYYY-MM-DD, "hour": int} — 1일 1회 가드
+            "last_daily_journal": None,     # YYYY-MM-DD — 하루 마무리 일지 1일 1회 가드
             "implementation_intentions": [],
             "weak_spot_candidates": {},
             # 도파민 trail 학습 — 딴짓 트리거 직전 sanitized 라벨 시퀀스 N-gram
@@ -806,6 +807,15 @@ class Store:
     @last_late_night_fired.setter
     def last_late_night_fired(self, value: Optional[str]) -> None:
         self._set("last_late_night_fired", value)
+
+    # ----------------------------------------------------- 하루 마무리 일지 1일 1회
+    @property
+    def last_daily_journal(self) -> Optional[str]:
+        return self._get("last_daily_journal")
+
+    @last_daily_journal.setter
+    def last_daily_journal(self, value: Optional[str]) -> None:
+        self._set("last_daily_journal", value)
 
     # ----------------------------------------------------- 위험 예측 1일 1회
     def risk_predict_already_fired_today(self) -> bool:
