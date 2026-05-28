@@ -49,17 +49,24 @@ class MessagingMixin:
     _RETRY_QUEUE_ALERT_COOLDOWN = 3 * 3600.0  # 같은 경고 N초 안에 또 보내지 않음
 
     # =================================================== 텔레그램 발송 wrapper
-    def _send(self, chat_id: int, text: str) -> bool:
+    def _send(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        reply_markup: Optional[dict] = None,
+    ) -> bool:
         """텔레그램 발송 wrapper. 일시적 실패에 짧은 backoff retry. 그래도
         실패하면 False — 잔소리/자동 메시지 경로는 영구 retry 큐에 적재하고,
         대화 답장은 pending_chat_reply 에 보관해 다음 turn 에 합쳐 답하도록.
-        연속 실패가 임계치를 넘으면 컨테이너 자살 → Railway 자동 재시작."""
-        ok = self._tg.send_message(chat_id, text)
+        연속 실패가 임계치를 넘으면 컨테이너 자살 → Railway 자동 재시작.
+        reply_markup: inline keyboard 등 첨부 (옵션)."""
+        ok = self._tg.send_message(chat_id, text, reply_markup=reply_markup)
         for delay in self._SEND_BACKOFF_SEC:
             if ok:
                 break
             time.sleep(delay)
-            ok = self._tg.send_message(chat_id, text)
+            ok = self._tg.send_message(chat_id, text, reply_markup=reply_markup)
         if ok:
             self._consecutive_tg_failures = 0
             return True
@@ -81,18 +88,24 @@ class MessagingMixin:
         *,
         kind: str,
         side_effects: Optional[dict] = None,
+        reply_markup: Optional[dict] = None,
     ) -> bool:
         """잔소리·자동 메시지 전용 발송. 첫 시도 성공 시 부수효과 즉시 적용,
-        실패 시 큐에 적재해 워커가 도달할 때까지 retry.
+        실패 시 큐에 적재해 워커가 도달할 때까지 retry. reply_markup 도 큐에
+        같이 보관되어 retry 도달 시점에도 버튼이 유지된다.
 
         반환: True = 첫 시도 도달 / False = 큐에 적재됨 (호출자는 추가 부수
         효과 코드를 두지 마라 — 모두 _apply_message_side_effects 에서)."""
         se = side_effects or {}
-        if self._send(chat_id, text):
+        if self._send(chat_id, text, reply_markup=reply_markup):
             self._apply_message_side_effects(kind, se)
             return True
         msg_id = self._store.add_pending_message(
-            kind=kind, chat_id=chat_id, text=text, side_effects=se
+            kind=kind,
+            chat_id=chat_id,
+            text=text,
+            side_effects=se,
+            reply_markup=reply_markup,
         )
         print(f"[App] 전송 실패 → retry 큐 적재 (kind={kind}, id={msg_id[:8]})")
         return False
@@ -214,8 +227,12 @@ class MessagingMixin:
                 # next_attempt_at 안 된 항목은 통과
                 if now < float(item.get("next_attempt_at", 0.0)):
                     continue
-                # 시도
-                ok = self._tg.send_message(item["chat_id"], item["text"])
+                # 시도 — reply_markup 도 같이 보존되어야 큐 도달 시점에도 버튼 유지
+                ok = self._tg.send_message(
+                    item["chat_id"],
+                    item["text"],
+                    reply_markup=item.get("reply_markup"),
+                )
                 if ok:
                     self._consecutive_tg_failures = 0
                     print(

@@ -145,6 +145,15 @@ Plan 구체적이면 register_implementation_intention 저장. 의지력 대신 
 - 현재 레벨 = 단기 목표 ([상태 메모]의 레벨 기준). 며칠 이어가면 칭찬, 시스템
   레벨업 시 같이 신나게. 수행 기록·레벨업은 시스템이 자동.
 
+■ mood 데이터 활용
+- 하루 마무리 일지·주간 회고 메시지엔 자동으로 mood 1~5 inline 버튼이 붙는다.
+  코치 답장 본문에 "기분 어땠어?" 같은 직접 질문 굳이 X — 버튼이 알아서 받음.
+- [상태 메모] 의 'mood 추세' 항목이 보이면, 답장 흐름에 *짧게* 끌어와 사용자
+  동기 부여 — "오늘 적은 mood 봤어, 어제보다 좋아졌네", "이번 주 평균 좀
+  떨어진 것 같아 — 컨디션 어때?" 같은 식. 매 답장 X — 자연스러운 흐름일 때만.
+- 자유 텍스트 답장에 기분이 묻어나면 log_mood 로 직접 기록 (rating 1~5).
+  버튼·텍스트 둘 다 같은 통계에 들어간다.
+
 ■ 도구
 - 활성 도구는 [상태 메모]의 '활성 도구' 항목에 떠. **그 목록에 없는 도구는
   호출·언급도 하지 마** — 예: 캘린더 도구가 없으면 "캘린더에 넣어줄까?" 같이
@@ -427,6 +436,25 @@ class CoachAgent:
                 + " — 이 중 *대화 흐름에 자연스러운* 한 가지만 가끔 슬쩍 물어봐 "
                 "(취조 X, 한 turn 에 여러 개 X)."
             )
+        # mood 추세 — 데이터 충분히 쌓이면 코치가 답장에 *짧게* 끌어와 사용자
+        # 동기 부여. 너무 자주 X — 자연스러운 흐름일 때만.
+        try:
+            weekly = self._store.weekly_summary(days=7)
+            rec = weekly.get("recent") or {}
+            prev = weekly.get("previous") or {}
+            mood_count = int(rec.get("mood_count") or 0)
+            mood_avg = rec.get("mood_avg")
+            if mood_count >= 5 and mood_avg is not None:
+                hint = f"mood 추세: 최근 7일 평균 {mood_avg:.1f}/5 ({mood_count}회 기록)"
+                prev_avg = prev.get("mood_avg")
+                if prev_avg is not None:
+                    diff = mood_avg - prev_avg
+                    sign = "+" if diff >= 0 else ""
+                    hint += f", 직전 주 대비 {sign}{diff:.1f}"
+                hint += " — 답장 자연스러운 흐름에 한 번씩 슬쩍 끌어와 (매번 X)."
+                parts.append(hint)
+        except Exception:
+            pass
         events_line = self._upcoming_events_summary()
         if events_line:
             parts.append(events_line)

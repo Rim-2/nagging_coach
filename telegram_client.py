@@ -48,20 +48,44 @@ class TelegramClient:
     def get_me(self) -> dict:
         return self._call("getMe")
 
-    def send_message(self, chat_id: int, text: str) -> bool:
+    def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        reply_markup: Optional[dict] = None,
+    ) -> bool:
+        """텔레그램 메시지 발송. reply_markup 으로 inline_keyboard 부착 가능.
+        예: reply_markup={"inline_keyboard": [[{"text": "😊", "callback_data": "mood:4"}, ...]]}
+        """
         try:
-            self._call(
-                "sendMessage",
-                {
-                    "chat_id": chat_id,
-                    "text": text,
-                    "disable_web_page_preview": True,
-                },
-            )
+            params = {
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": True,
+            }
+            if reply_markup is not None:
+                params["reply_markup"] = reply_markup
+            self._call("sendMessage", params)
             return True
         except Exception as exc:
             print(f"[Telegram] 메시지 전송 실패: {exc}")
             return False
+
+    def answer_callback_query(
+        self,
+        callback_query_id: str,
+        text: Optional[str] = None,
+    ) -> None:
+        """사용자가 inline keyboard 버튼을 탭하면 텔레그램이 로딩 표시를 띄운다.
+        이 호출이 그 로딩을 멈춤 + (옵션) toast 메시지로 짧은 확인 표시.
+        실패해도 사용자 데이터엔 영향 없으므로 silent."""
+        try:
+            params = {"callback_query_id": callback_query_id}
+            if text:
+                params["text"] = text
+            self._call("answerCallbackQuery", params, timeout=10.0)
+        except Exception as exc:
+            print(f"[Telegram] answerCallbackQuery 실패 (무시): {exc}")
 
     def download_file(self, file_id: str) -> bytes:
         """file_id 로 텔레그램 서버에서 파일(사진 등) 원본 바이트를 받아온다."""
@@ -111,7 +135,7 @@ class TelegramClient:
             try:
                 params = {
                     "timeout": self.POLL_TIMEOUT,
-                    "allowed_updates": ["message"],
+                    "allowed_updates": ["message", "callback_query"],
                 }
                 if offset is not None:
                     params["offset"] = offset

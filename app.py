@@ -236,6 +236,10 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
     # ==================================================== 텔레그램 수신
     def _on_update(self, update: dict) -> None:
         """텔레그램 폴링 스레드에서 호출됨."""
+        # inline keyboard 버튼 콜백 — 별도 흐름 (text 메시지 처리 X).
+        if "callback_query" in update:
+            self._handle_callback_query(update["callback_query"])
+            return
         message = update.get("message") or {}
         text = (message.get("text") or "").strip()
         caption = (message.get("caption") or "").strip()
@@ -324,6 +328,43 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
             self._handle_photo(chat_id, photo, caption)
             return
         self._handle_chat(chat_id, text)
+
+    # ============================================== inline keyboard 콜백
+    # callback_data 포맷: "namespace:value". 현재 등록된 네임스페이스:
+    #   "mood:N"  → store.add_mood_log(N) — 일지·주간 회고 mood 버튼
+    def _handle_callback_query(self, cq: dict) -> None:
+        cq_id = cq.get("id", "")
+        from_chat = (cq.get("message") or {}).get("chat") or {}
+        chat_id = from_chat.get("id")
+        registered = self._store.chat_id
+        if chat_id is None or chat_id != registered:
+            # 등록된 사용자 외 콜백은 무시. 로딩 표시만 끄고 끝.
+            if cq_id:
+                self._tg.answer_callback_query(cq_id)
+            return
+        data = str(cq.get("data") or "")
+        ack_text: Optional[str] = None
+        try:
+            if data.startswith("mood:"):
+                try:
+                    rating = int(data.split(":", 1)[1])
+                except ValueError:
+                    rating = 0
+                if 1 <= rating <= 5:
+                    self._store.add_mood_log(rating)
+                    self._last_user_msg = time.time()   # 응답으로 간주
+                    emoji = {1: "😞", 2: "😕", 3: "😐", 4: "🙂", 5: "😄"}[rating]
+                    ack_text = f"{emoji} {rating}/5 기록했어"
+                    print(f"[App] mood 버튼 기록: {rating}")
+                else:
+                    ack_text = "잘못된 값이야"
+            else:
+                print(f"[App] 알 수 없는 callback_data: {data!r}")
+        except Exception as exc:
+            print(f"[App] callback_query 처리 오류: {exc}")
+        finally:
+            if cq_id:
+                self._tg.answer_callback_query(cq_id, text=ack_text)
 
     def _handle_start(self, chat_id: int) -> None:
         self._store.chat_id = chat_id

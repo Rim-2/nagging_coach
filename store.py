@@ -430,8 +430,10 @@ class Store:
         chat_id: int,
         text: str,
         side_effects: Optional[dict] = None,
+        reply_markup: Optional[dict] = None,
     ) -> str:
-        """새 retry 항목을 큐에 적재. 반환: 새 항목 id."""
+        """새 retry 항목을 큐에 적재. 반환: 새 항목 id.
+        reply_markup 이 있으면 함께 보관해 retry 도달 시점에도 inline keyboard 유지."""
         import uuid
         with self._lock:
             now = time.time()
@@ -441,6 +443,7 @@ class Store:
                 "chat_id": chat_id,
                 "text": text,
                 "side_effects": side_effects or {},
+                "reply_markup": reply_markup,
                 "attempts": 0,
                 "first_attempt_at": now,
                 "next_attempt_at": now,   # 즉시 첫 워커 시도

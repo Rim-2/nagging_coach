@@ -28,6 +28,19 @@ from ai_engine import AIGenerationError
 from tracker import State
 
 
+# inline keyboard — mood 1~5 빠른 응답 버튼. callback_data="mood:N"
+# 사용자가 탭하면 app._handle_callback_query 가 store.add_mood_log(N) 호출.
+MOOD_KEYBOARD = {
+    "inline_keyboard": [[
+        {"text": "😞 1", "callback_data": "mood:1"},
+        {"text": "😕 2", "callback_data": "mood:2"},
+        {"text": "😐 3", "callback_data": "mood:3"},
+        {"text": "🙂 4", "callback_data": "mood:4"},
+        {"text": "😄 5", "callback_data": "mood:5"},
+    ]]
+}
+
+
 class LoopsMixin:
     """모든 백그라운드 데몬 루프를 담는 mixin."""
 
@@ -319,7 +332,9 @@ class LoopsMixin:
                 continue
             print("[App] 하루 마무리 일지 발송")
             self._store.last_daily_journal = today_s
-            self._send_or_enqueue(chat_id, reply, kind="daily_journal")
+            self._send_or_enqueue(
+                chat_id, reply, kind="daily_journal", reply_markup=MOOD_KEYBOARD,
+            )
 
     # ====================================================== 주간 회고
     def _weekly_review_loop(self) -> None:
@@ -343,7 +358,9 @@ class LoopsMixin:
                 print(f"[App] 주간 회고 생성 실패: {exc}")
                 continue
             print("[App] 주간 회고 발송")
-            self._send_or_enqueue(chat_id, reply, kind="weekly_review")
+            self._send_or_enqueue(
+                chat_id, reply, kind="weekly_review", reply_markup=MOOD_KEYBOARD,
+            )
 
     # ====================================================== 매일 재시작
     def _daily_restart_loop(self) -> None:
