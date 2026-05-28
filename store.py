@@ -229,6 +229,37 @@ class Store:
         with self._lock:
             return [dict(g) for g in self._data["today_goals"]]
 
+    @staticmethod
+    def _match_today_goals(goals: List[dict], key: str) -> List[dict]:
+        """주어진 키와 매칭되는 today_goals 항목들을 우선순위 단계로 추려낸다:
+        1) 정확 매칭 (name == key) → 단 한 개만 매칭되어도 그것만
+        2) 한 이름이 key 의 *접두/접미* 인 경우 (사용자 표현이 풍성한 경우)
+        3) 그것도 없으면 *유일한 substring* 매칭만 (다중 substring 이면 모호 → 빈 list)
+
+        sub_step 부분 매칭의 모호함은 LLM 에 다시 묻게 해 의도치 않은 다중 삭제
+        를 차단. *시도한 목표만* 정확히 처리되도록."""
+        if not key:
+            return []
+        key = key.strip().lower()
+        if not key:
+            return []
+        # 1) 정확 매칭
+        exact = [g for g in goals if g["name"].lower() == key]
+        if exact:
+            return exact
+        # 2) 접두/접미 (key가 길고 name이 짧을 때 — "유튜브 정리하기 끝" → name="유튜브 정리하기")
+        prefix_suffix = [
+            g for g in goals
+            if key.startswith(g["name"].lower()) or key.endswith(g["name"].lower())
+        ]
+        if len(prefix_suffix) == 1:
+            return prefix_suffix
+        # 3) 유일한 substring 매칭만 — 다중이면 모호로 보고 빈 list (호출자가 LLM 에 재질의)
+        substring = [g for g in goals if key in g["name"].lower() or g["name"].lower() in key]
+        if len(substring) == 1:
+            return substring
+        return []
+
     def add_today_goal(
         self, goal: str, sub_steps: Optional[List[str]] = None
     ) -> bool:
@@ -247,6 +278,8 @@ class Store:
                     str(s).strip() for s in (sub_steps or []) if str(s).strip()
                 ],
                 "current": 0,
+                # 등록 날짜 — 같은 날 등록·취소를 깨끗하게 분모에서 빼기 위함.
+                "registered_date": datetime.date.today().isoformat(),
             })
             # 캐파 분모 — '오늘 시도한 일'이 얼마나 되는지. 완료/시도 비율을
             # weekly_summary 가 보고 코치가 사용자 캐파에 맞게 분량을 조절.
@@ -258,20 +291,17 @@ class Store:
     def advance_today_goal(self, goal: str) -> Optional[dict]:
         """sub_step 하나 완료로 표시. current += 1, 마지막을 넘기면 goal 자체를
         완료 처리(목록에서 제거 + goals_completed 카운터 +1). sub_steps 가 없는
-        goal 이거나 일치하는 goal 이 없으면 None.
-        반환: {next_step: 다음 sub_step 또는 None, current, total, completed: bool}"""
-        key = goal.strip().lower()
-        if not key:
-            return None
+        goal 이거나 일치하는 goal 이 없거나 *모호한 다중 매칭*이면 None.
+        반환: {next_step, current, total, completed} 또는 None.
+
+        sub_step 단계 한 칸 전진할 때마다 bucket['sub_step_advances'] 도 +1 —
+        '오늘 작은 단계 N번 진척' 같은 *세분화된* 진척 통계용 (기존 goals_completed
+        는 *목표 단위* 그대로 유지)."""
         with self._lock:
-            target = None
-            for g in self._data["today_goals"]:
-                n = g["name"].lower()
-                if n == key or key in n or n in key:
-                    target = g
-                    break
-            if target is None:
+            matches = self._match_today_goals(self._data["today_goals"], goal)
+            if len(matches) != 1:
                 return None
+            target = matches[0]
             sub = target.get("sub_steps") or []
             if not sub:
                 return None
@@ -285,10 +315,16 @@ class Store:
                 "total": len(sub),
                 "completed": completed,
             }
+            bucket = self._today_bucket()
+            # 단계별 진척 카운터 — 매 advance 마다 +1
+            bucket["sub_step_advances"] = bucket.get("sub_step_advances", 0) + 1
+            hk = self._hour_key()
+            bucket.setdefault("hourly_sub_step_advances", {})
+            bucket["hourly_sub_step_advances"][hk] = (
+                bucket["hourly_sub_step_advances"].get(hk, 0) + 1
+            )
             if completed:
-                bucket = self._today_bucket()
                 bucket["goals_completed"] = bucket.get("goals_completed", 0) + 1
-                hk = self._hour_key()
                 bucket["hourly_goals_completed"][hk] = (
                     bucket["hourly_goals_completed"].get(hk, 0) + 1
                 )
@@ -299,27 +335,25 @@ class Store:
             return result
 
     def complete_today_goal(self, goal: str) -> bool:
-        """끝낸 오늘 목표를 목록에서 제거한다 (부분 일치, name 기준). 제거했으면
-        True — 일별 통계의 goals_completed 도 함께 +1."""
-        key = goal.strip().lower()
-        if not key:
-            return False
+        """끝낸 오늘 목표를 목록에서 제거. 매칭 헬퍼로 *유일한* 항목만 처리하며,
+        모호한 다중 매칭이면 False (호출자가 LLM 에 재질의). 제거 시 일별 통계의
+        goals_completed +1."""
         with self._lock:
-            before = len(self._data["today_goals"])
+            matches = self._match_today_goals(self._data["today_goals"], goal)
+            if len(matches) != 1:
+                return False
+            target = matches[0]
             self._data["today_goals"] = [
-                g for g in self._data["today_goals"]
-                if key not in g["name"].lower() and g["name"].lower() not in key
+                g for g in self._data["today_goals"] if g is not target
             ]
-            changed = len(self._data["today_goals"]) != before
-            if changed:
-                bucket = self._today_bucket()
-                bucket["goals_completed"] = bucket.get("goals_completed", 0) + 1
-                hk = self._hour_key()
-                bucket["hourly_goals_completed"][hk] = (
-                    bucket["hourly_goals_completed"].get(hk, 0) + 1
-                )
-                self._persist()
-            return changed
+            bucket = self._today_bucket()
+            bucket["goals_completed"] = bucket.get("goals_completed", 0) + 1
+            hk = self._hour_key()
+            bucket["hourly_goals_completed"][hk] = (
+                bucket["hourly_goals_completed"].get(hk, 0) + 1
+            )
+            self._persist()
+            return True
 
     @property
     def long_term_goal(self) -> Optional[str]:
@@ -1278,21 +1312,29 @@ class Store:
             return removed
 
     def cancel_today_goal(self, name: str) -> bool:
-        """오늘 목표를 *취소* (완료가 아닌 단순 삭제). complete_today_goal 과
-        다름 — daily_stats.goals_completed 카운터 안 올림."""
-        key = (name or "").strip().lower()
-        if not key:
-            return False
+        """오늘 목표를 *취소* (완료가 아닌 단순 삭제). 매칭 헬퍼로 유일한 항목만.
+        등록일이 오늘이면 *분모(goals_registered)*도 같이 차감 — 시도조차 안 한
+        목표가 완료율을 낮춰 캐파 가이드를 왜곡시키지 않게."""
         with self._lock:
-            before = len(self._data["today_goals"])
+            matches = self._match_today_goals(self._data["today_goals"], name)
+            if len(matches) != 1:
+                return False
+            target = matches[0]
             self._data["today_goals"] = [
-                g for g in self._data["today_goals"]
-                if key not in g["name"].lower() and g["name"].lower() not in key
+                g for g in self._data["today_goals"] if g is not target
             ]
-            changed = len(self._data["today_goals"]) != before
-            if changed:
-                self._persist()
-            return changed
+            # 오늘 등록·오늘 취소면 분모도 -1. 어제 등록된 거 오늘 취소는 분모
+            # 유지 (어제 자 통계는 그대로). registered_date 마이그레이션 안 된
+            # 옛 항목은 *오늘 자*로 간주해 차감 (안전한 쪽으로).
+            today_s = datetime.date.today().isoformat()
+            reg_date = target.get("registered_date") or today_s
+            if reg_date == today_s:
+                bucket = self._today_bucket()
+                current = int(bucket.get("goals_registered", 0) or 0)
+                if current > 0:
+                    bucket["goals_registered"] = current - 1
+            self._persist()
+            return True
 
     # --------------------------------------------------------- 대화 기록
     @property

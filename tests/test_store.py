@@ -165,3 +165,71 @@ class TestDopamineTrails:
         fresh_store.bump_dopamine_trail(["a", "b", "d"])  # count=1
         # min_count=2 면 둘 다 노이즈로 제외
         assert fresh_store.top_dopamine_trails(min_count=2) == []
+
+
+# -------------------------------------------------------- 목표 카운트 정밀화
+class TestTodayGoalsCounting:
+    def test_add_increments_registered(self, fresh_store):
+        assert fresh_store.add_today_goal("발표 자료")
+        from datetime import date
+        bucket = fresh_store.daily_stats[date.today().isoformat()]
+        assert bucket["goals_registered"] == 1
+        assert bucket.get("goals_completed", 0) == 0
+
+    def test_exact_match_preferred_over_substring(self, fresh_store):
+        # 짧은 이름이 긴 이름의 substring 인 케이스 — 정확 매칭 우선
+        fresh_store.add_today_goal("A")
+        fresh_store.add_today_goal("AB")
+        # "A" 완료 → "A" 만 사라져야 (정확 매칭)
+        assert fresh_store.complete_today_goal("A") is True
+        names = [g["name"] for g in fresh_store.today_goals_detailed]
+        assert names == ["AB"]
+
+    def test_ambiguous_substring_blocks(self, fresh_store):
+        # 두 목표 모두에 매칭되는 모호한 키워드 → False, 둘 다 그대로
+        fresh_store.add_today_goal("발표 자료 만들기")
+        fresh_store.add_today_goal("발표 자료 검토")
+        # "발표 자료" 만 보내면 둘 다 매칭 → 모호 → 처리 안 함
+        assert fresh_store.complete_today_goal("발표 자료") is False
+        assert len(fresh_store.today_goals_detailed) == 2
+
+    def test_cancel_same_day_decrements_registered(self, fresh_store):
+        fresh_store.add_today_goal("취소될 목표")
+        assert fresh_store.cancel_today_goal("취소될 목표") is True
+        from datetime import date
+        bucket = fresh_store.daily_stats[date.today().isoformat()]
+        # 같은 날 등록·취소 → 분모도 -1 (시도조차 안 한 것)
+        assert bucket["goals_registered"] == 0
+        # 완료가 아니므로 goals_completed 는 0
+        assert bucket.get("goals_completed", 0) == 0
+
+    def test_advance_records_sub_step_stat(self, fresh_store):
+        fresh_store.add_today_goal("발표", sub_steps=["골격", "본문", "리허설"])
+        result = fresh_store.advance_today_goal("발표")
+        assert result is not None
+        assert result["current"] == 1
+        assert result["completed"] is False
+        from datetime import date
+        bucket = fresh_store.daily_stats[date.today().isoformat()]
+        assert bucket.get("sub_step_advances", 0) == 1
+        # 아직 마지막 단계 X — goals_completed 안 올라감
+        assert bucket.get("goals_completed", 0) == 0
+
+    def test_advance_last_step_completes_goal(self, fresh_store):
+        fresh_store.add_today_goal("발표", sub_steps=["A", "B"])
+        fresh_store.advance_today_goal("발표")
+        result = fresh_store.advance_today_goal("발표")
+        assert result["completed"] is True
+        from datetime import date
+        bucket = fresh_store.daily_stats[date.today().isoformat()]
+        assert bucket["goals_completed"] == 1
+        assert bucket["sub_step_advances"] == 2
+        assert fresh_store.today_goals_detailed == []
+
+    def test_ambiguous_advance_blocked(self, fresh_store):
+        # 모호한 매칭이면 advance 도 None — 의도치 않은 다중 진척 방지
+        fresh_store.add_today_goal("발표 자료", sub_steps=["A", "B"])
+        fresh_store.add_today_goal("발표 연습", sub_steps=["C", "D"])
+        result = fresh_store.advance_today_goal("발표")
+        # 둘 다 substring 매칭 → 모호 → None
+        assert result is None
