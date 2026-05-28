@@ -142,6 +142,12 @@ class Store:
             # `/place 라벨` 직후 사용자가 위치 메시지를 5분 안에 보내야 등록된다.
             "pending_place_label": None,    # str 또는 None
             "pending_place_at": 0.0,        # unix timestamp
+            # quiet_mode — 사용자가 외출·취침 같은 *조용히 해야 할 상황*을 명시
+            # 선언했을 때 모든 자동 발사를 보류. None 이면 정상.
+            # kind: "away" | "sleep" 또는 None.
+            "quiet_mode": None,             # str 또는 None
+            "quiet_mode_started_at": 0.0,
+            "quiet_mode_suppressed_count": 0,  # 모드 활성 중 보류된 발사 건수
         }
         self._load()
 
@@ -566,6 +572,69 @@ class Store:
     def places(self) -> List[dict]:
         with self._lock:
             return [dict(p) for p in (self._data.get("places") or [])]
+
+    # --------------------------------------------------------- quiet_mode
+    QUIET_MODE_TTL_SEC = 24 * 3600.0     # 24h 안전 fallback — 영영 잠수 방지
+
+    def enter_quiet_mode(self, kind: str) -> bool:
+        """외출·취침 같은 *조용 모드* 진입. 이미 같은 종류로 활성이면 False
+        (재진입 무의미). 다른 종류면 갱신."""
+        kind = (kind or "").strip().lower()
+        if kind not in ("away", "sleep"):
+            return False
+        with self._lock:
+            current = self._data.get("quiet_mode")
+            if current == kind:
+                return False
+            self._data["quiet_mode"] = kind
+            self._data["quiet_mode_started_at"] = time.time()
+            self._data["quiet_mode_suppressed_count"] = 0
+            self._persist()
+            return True
+
+    def exit_quiet_mode(self) -> Optional[dict]:
+        """모드 해제. 활성이었으면 dict({kind, suppressed_count, duration_sec})
+        를 반환해 호출자가 안내 메시지 만들 수 있게. 비활성이었으면 None."""
+        with self._lock:
+            current = self._data.get("quiet_mode")
+            if not current:
+                return None
+            info = {
+                "kind": current,
+                "suppressed_count": int(self._data.get("quiet_mode_suppressed_count") or 0),
+                "duration_sec": time.time() - float(
+                    self._data.get("quiet_mode_started_at") or time.time()
+                ),
+            }
+            self._data["quiet_mode"] = None
+            self._data["quiet_mode_started_at"] = 0.0
+            self._data["quiet_mode_suppressed_count"] = 0
+            self._persist()
+            return info
+
+    @property
+    def quiet_mode(self) -> Optional[str]:
+        """현재 활성 모드 — 'away'/'sleep'/None. 24h 초과 시 자동 만료."""
+        with self._lock:
+            kind = self._data.get("quiet_mode")
+            if not kind:
+                return None
+            started = float(self._data.get("quiet_mode_started_at") or 0.0)
+            if time.time() - started > self.QUIET_MODE_TTL_SEC:
+                # 만료 — None 으로 정리 (호출자가 별도 안내 X)
+                self._data["quiet_mode"] = None
+                self._data["quiet_mode_started_at"] = 0.0
+                self._data["quiet_mode_suppressed_count"] = 0
+                self._persist()
+                return None
+            return kind
+
+    def bump_quiet_suppressed(self) -> None:
+        """모드 활성 중 자동 발사가 보류될 때 호출. 해제 시 안내에 사용."""
+        with self._lock:
+            n = int(self._data.get("quiet_mode_suppressed_count") or 0)
+            self._data["quiet_mode_suppressed_count"] = n + 1
+            self._persist()
 
     # --------------------------------------------------------- 폰 컨텍스트
     def update_phone_context(self, snap: dict) -> None:

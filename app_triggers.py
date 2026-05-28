@@ -54,6 +54,12 @@ class TriggersMixin:
         if chat_id is None:
             self._tracker.resume_normal()
             return
+        # quiet_mode 활성 시 잔소리 보류 — 트래커 상태는 normal 로 돌려 다음
+        # 트리거에도 평가가 이어지게.
+        if self._quiet_mode_block():
+            print(f"[App] 트리거 [{trigger.value}] quiet_mode 활성 — 보류")
+            self._tracker.resume_normal()
+            return
 
         goals = self._store.today_goals
         goal = ", ".join(goals) if goals else None
@@ -224,8 +230,24 @@ class TriggersMixin:
         if device == "phone":
             try:
                 self._store.update_phone_context(snap)
+                # place=="집" 자동 감지 → away 모드 해제. exit_quiet_mode 가 dict
+                # 반환하므로 보류 건수 있으면 안내 메시지 발사.
+                if (
+                    snap.get("place_category") == "집"
+                    and self._store.quiet_mode == "away"
+                ):
+                    info = self._store.exit_quiet_mode()
+                    if info is not None:
+                        self._on_quiet_exit(info)
             except Exception as exc:
                 print(f"[App] phone_context 갱신 실패: {exc}")
+
+        # quiet_mode 활성 시 모든 잔소리 보류 (사용자 명시 선언 → 자동 발사 X)
+        if self._quiet_mode_block():
+            print(
+                f"[App] (원격) 트리거 [{trigger_value}] quiet_mode 활성 — 보류"
+            )
+            return {"ok": True, "action": "skipped", "reason": "quiet_mode"}
 
         # 디바이스 상태 가드 (폰 위성 페이로드에 같이 옴). 사용자가 명시적으로
         # 방해 차단(DND)을 걸어둔 상태에선 *낮은 우선순위* 트리거는 잔소리 보류 —

@@ -92,6 +92,8 @@ _HELP_TEXT = (
     "/reset — 대화·목표·습관·일정 다 비우기 (설정·통계는 유지)\n"
     "/reset all — 통계·설정·약점 학습까지 전부 비우기 (처음 만난 상태로)\n"
     "/place 라벨 — 장소 등록 (다음 5분 안에 위치 메시지)\n"
+    "/away · /sleep — 외출·취침 모드 (자동 잔소리 보류)\n"
+    "/wake · /back — 모드 해제 (메시지 보내면 자동)\n"
 )
 # 그 외 자동 복구·루프 관련 상수는 mixin 모듈로 분리:
 #   - 텔레그램 연속 실패 시 컨테이너 자살: app_messaging (TG_FAILURE_EXIT_THRESHOLD)
@@ -117,6 +119,7 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
             on_goal_set=self._on_goal_set,
             on_today_complete=self._on_today_complete,
             on_back_on_track=self._on_back_on_track,
+            on_quiet_exit=self._on_quiet_exit,
         )
         self._tracker = self._init_tracker()
 
@@ -293,6 +296,29 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
 
         if text.startswith("/place"):
             self._handle_place_command(chat_id, text)
+            return
+
+        if text.startswith("/away") or text.startswith("/sleep"):
+            kind = "away" if text.startswith("/away") else "sleep"
+            if self._store.enter_quiet_mode(kind):
+                label = "외출" if kind == "away" else "취침"
+                self._send(
+                    chat_id,
+                    f"({label} 모드 — 돌아오거나 일어날 때까지 자동 잔소리 보류. "
+                    "메시지 보내면 자동 해제. 24h 안전 한도 있어.)",
+                )
+            else:
+                self._send(chat_id, "이미 같은 모드야.")
+            return
+
+        if text.startswith("/wake") or text.startswith("/back"):
+            info = self._store.exit_quiet_mode()
+            if info is None:
+                self._send(chat_id, "비활성 모드였어 — 변화 없음.")
+            else:
+                self._on_quiet_exit(info)
+                if int(info.get("suppressed_count") or 0) == 0:
+                    self._send(chat_id, "모드 해제. 정상 동작.")
             return
 
         if text.startswith("/reset"):
@@ -548,6 +574,12 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
         """사용자 chat 메시지 도착 → 짧은 debounce 후 LLM 호출. 같은 debounce
         창 안에 추가 메시지가 오면 버퍼에 누적되어 *한 번에* 묶여 답장된다."""
         self._last_user_msg = time.time()
+        # 취침 모드면 사용자가 답한 것 = 깨어남. 자동 해제 + 안내.
+        # (외출 모드는 사용자 발화에 "왔어/들어왔어" 가 있을 때 EXTRACT 가 잡아 해제.)
+        if self._store.quiet_mode == "sleep":
+            info = self._store.exit_quiet_mode()
+            if info is not None:
+                self._on_quiet_exit(info)
         with self._chat_buffer_lock:
             self._chat_buffer.append(text)
             # 기존 타이머 취소 후 새 타이머 — 우다다 도착 시 매번 만료 시각 갱신
@@ -642,6 +674,31 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
         self._cancel_warning_timeout()
         if self._tracker is not None:
             self._tracker.resume_normal()
+
+    # =================================================== quiet_mode
+    def _on_quiet_exit(self, info: dict) -> None:
+        """모드 해제 시 호출 — 보류 건수가 있으면 한 줄 안내."""
+        kind = info.get("kind")
+        n = int(info.get("suppressed_count") or 0)
+        chat_id = self._store.chat_id
+        if chat_id is None:
+            return
+        if n <= 0:
+            return  # 보류된 게 없으면 안내 안 함 (소음 최소)
+        label = "외출" if kind == "away" else "취침"
+        self._send(
+            chat_id,
+            f"({label} 동안 자동 잔소리 {n}건 보류했어 — 지금 다시 정상)",
+        )
+
+    def _quiet_mode_block(self) -> bool:
+        """자동 발사 진입 시 호출. 활성이면 True 반환 + 보류 카운트 +1.
+        호출자는 True 일 때 그냥 return — 메시지 안 보냄."""
+        kind = self._store.quiet_mode
+        if kind:
+            self._store.bump_quiet_suppressed()
+            return True
+        return False
 
     # =================================================== Warning 타임아웃
     def _arm_warning_timeout(self) -> None:

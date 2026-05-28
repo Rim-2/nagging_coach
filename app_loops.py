@@ -80,6 +80,8 @@ class LoopsMixin:
             chat_id = self._store.chat_id
             if chat_id is None:
                 continue
+            if self._quiet_mode_block():
+                continue
             # SLEEP(완료) 또는 WARNING(잔소리 중)이면 먼저 말 걸지 않는다.
             # Tracker 가 꺼져 있으면 상태 개념이 없으므로 그대로 진행한다.
             if self._tracker is not None and self._tracker.state != State.NORMAL:
@@ -278,6 +280,8 @@ class LoopsMixin:
                 continue
             if self._store.active_nag_policy == "gentle":
                 continue
+            if self._quiet_mode_block():
+                continue
             if self._store.risk_predict_already_fired_today():
                 continue
             now = datetime.datetime.now()
@@ -325,6 +329,8 @@ class LoopsMixin:
             today_s = now.date().isoformat()
             if self._store.last_daily_journal == today_s:
                 continue
+            if self._quiet_mode_block():
+                continue
             try:
                 reply = self._agent.daily_journal()
             except AIGenerationError as exc:
@@ -351,6 +357,8 @@ class LoopsMixin:
                 continue
             today_s = now.date().isoformat()
             if self._store.last_weekly_review == today_s:
+                continue
+            if self._quiet_mode_block():
                 continue
             try:
                 reply = self._agent.weekly_review()
