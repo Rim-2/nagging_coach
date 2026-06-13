@@ -36,7 +36,7 @@ from ai_engine import AIGenerationError, CoachAgent
 from app_http import PHONE_APP_LABELS, HttpServerMixin
 from app_loops import LoopsMixin
 from app_messaging import MessagingMixin
-from app_triggers import TriggersMixin
+from app_triggers import NAG_KEYBOARD, TriggersMixin
 from calendar_client import CalendarClient
 from store import Store
 from telegram_client import TelegramClient
@@ -68,6 +68,7 @@ STATE_PATH = os.getenv("STATE_PATH") or os.path.join(
 )
 
 WARNING_TIMEOUT_SEC = 600.0       # 잔소리 후 응답 없으면 10분 뒤 감시 자동 정상화
+SNOOZE_SEC = 20 * 60.0            # 잔소리 '좀따 ⏰' 버튼 → 20분 뒤 가볍게 재알림
 AI_FAILURE_WARN_THRESHOLD = 3     # 연속 N회 실패 시 사용자에게 시스템 경고
 RESET_CONFIRM_TTL = 60.0          # /reset 첫 명령 후 N초 안에 한 번 더 보내야 실행
 CHAT_DEBOUNCE_SEC = 1.5           # 사용자 chat 짧은 간격 우다다 → 묶어서 한 번에 답장
@@ -132,6 +133,8 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
         self._consecutive_tg_failures = 0    # 텔레그램 발송 연속 실패 카운터 (자동 재시작용)
         self._started_at = time.time()       # 컨테이너 시작 시각 (매일 재시작 판단용)
         self._ignored_nags = 0               # 연속으로 무시당한 잔소리 횟수
+        self._meta_checkin_sent = False      # 현재 무시 streak 에서 메타 체크인 보냈는지
+        self._snooze_timer: Optional[threading.Timer] = None  # '좀따' 재알림 타이머
         self._remote_cooldowns: dict[str, float] = {}  # trigger_value → 다음 발동 가능 시각
         self._remote_cooldown_lock = threading.Lock()
         # /reset 확인 쿠션 — 첫 명령은 안내 메시지, 60초 안에 같은 명령 한 번 더
@@ -425,7 +428,9 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
 
     # ============================================== inline keyboard 콜백
     # callback_data 포맷: "namespace:value". 현재 등록된 네임스페이스:
-    #   "mood:N"  → store.add_mood_log(N) — 일지·주간 회고 mood 버튼
+    #   "mood:N"     → store.add_mood_log(N) — 일지·주간 회고 mood 버튼
+    #   "nag:action" → 잔소리 응답 버튼 (ack/snooze/pass). 스와이프로 흘려보내는
+    #                  습관을 깨고 명시적 신호를 받기 위한 pattern-interrupt.
     def _handle_callback_query(self, cq: dict) -> None:
         cq_id = cq.get("id", "")
         from_chat = (cq.get("message") or {}).get("chat") or {}
@@ -452,6 +457,8 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
                     print(f"[App] mood 버튼 기록: {rating}")
                 else:
                     ack_text = "잘못된 값이야"
+            elif data.startswith("nag:"):
+                ack_text = self._handle_nag_action(data.split(":", 1)[1], chat_id)
             else:
                 print(f"[App] 알 수 없는 callback_data: {data!r}")
         except Exception as exc:
@@ -459,6 +466,41 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
         finally:
             if cq_id:
                 self._tg.answer_callback_query(cq_id, text=ack_text)
+
+    def _handle_nag_action(self, action: str, chat_id: int) -> Optional[str]:
+        """잔소리에 붙은 inline 버튼 응답 처리. 어떤 버튼이든 *명시적 응답*이므로
+        무시 streak 을 리셋하고 warning 타임아웃을 끈다 — 침묵으로 흘려보내던
+        걸 한 번의 탭으로 바꾸는 게 핵심. 반환값은 버튼 토스트 문구."""
+        self._last_user_msg = time.time()
+        if action == "ack":
+            # '알겠어' — 한 발 움직이기로. 복귀로 간주.
+            self._reset_ignore_streak()
+            self._cancel_warning_timeout()
+            self._cancel_snooze()
+            if self._tracker is not None:
+                self._tracker.resume_normal()
+            return "좋아, 한 발만 가보자 👍"
+        if action == "snooze":
+            # '좀따' — 20분 뒤 가볍게 다시 부른다. 미루기를 명시적 약속으로 전환.
+            self._reset_ignore_streak()
+            self._cancel_warning_timeout()
+            self._arm_snooze(chat_id)
+            return "ok, 20분 뒤에 다시 부를게 ⏰"
+        if action == "pass":
+            # '패스' — 명시적 거절. 침묵보다 훨씬 나은 신호 → 다그치지 않고 물러난다.
+            self._reset_ignore_streak()
+            self._cancel_warning_timeout()
+            self._cancel_snooze()
+            if self._tracker is not None:
+                self._tracker.resume_normal()
+            return "알겠어, 오늘은 패스. 무리하진 말고 🙅"
+        print(f"[App] 알 수 없는 nag action: {action!r}")
+        return None
+
+    def _reset_ignore_streak(self) -> None:
+        """사용자가 응답·복귀하면 무시 누적과 메타 체크인 플래그를 함께 리셋."""
+        self._ignored_nags = 0
+        self._meta_checkin_sent = False
 
     def _handle_start(self, chat_id: int) -> None:
         self._store.chat_id = chat_id
@@ -663,15 +705,17 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
 
     def _on_today_complete(self) -> None:
         print("[App] 오늘 목표 완료")
-        self._ignored_nags = 0
+        self._reset_ignore_streak()
         self._cancel_warning_timeout()
+        self._cancel_snooze()
         if self._tracker is not None:
             self._tracker.sleep()
 
     def _on_back_on_track(self) -> None:
         print("[App] 사용자 복귀")
-        self._ignored_nags = 0
+        self._reset_ignore_streak()
         self._cancel_warning_timeout()
+        self._cancel_snooze()
         if self._tracker is not None:
             self._tracker.resume_normal()
 
@@ -726,6 +770,42 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
         )
         if self._tracker is not None:
             self._tracker.resume_normal()
+
+    # =================================================== 스누즈 ('좀따' 버튼)
+    def _arm_snooze(self, chat_id: int) -> None:
+        """'좀따' 응답 후 SNOOZE_SEC 뒤 가벼운 재알림을 예약. 메모리 타이머라
+        봇 재시작 시 사라지지만 20분짜리 단기 약속이라 허용 범위."""
+        with self._timer_lock:
+            if self._snooze_timer:
+                self._snooze_timer.cancel()
+            self._snooze_timer = threading.Timer(
+                SNOOZE_SEC, self._fire_snooze_nudge, args=(chat_id,)
+            )
+            self._snooze_timer.daemon = True
+            self._snooze_timer.start()
+
+    def _cancel_snooze(self) -> None:
+        with self._timer_lock:
+            if self._snooze_timer:
+                self._snooze_timer.cancel()
+                self._snooze_timer = None
+
+    def _fire_snooze_nudge(self, chat_id: int) -> None:
+        """스누즈 만료 — 짧은 canned 재알림 (AI 호출 없이) + 같은 버튼 재부착.
+        무시하면 다시 warning 타임아웃이 무시 카운트를 올린다."""
+        with self._timer_lock:
+            self._snooze_timer = None
+        if self._quiet_mode_block():
+            print("[App] 스누즈 재알림 — quiet_mode 활성, 보류")
+            return
+        print("[App] 스누즈 재알림 발송")
+        self._send_or_enqueue(
+            chat_id,
+            "(아까 좀따 한 거) 20분 지났어 — 이제 슬슬 가볼까? 🙂",
+            kind="snooze_nudge",
+            reply_markup=NAG_KEYBOARD,
+        )
+        self._arm_warning_timeout()
 
     # 모든 백그라운드 루프 (_proactive_loop, _reminder_loop, _alarm_loop,
     # _risk_predict_loop, _daily_journal_loop, _weekly_review_loop,

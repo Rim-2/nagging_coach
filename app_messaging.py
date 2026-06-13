@@ -148,7 +148,7 @@ class MessagingMixin:
             if eid:
                 self._store.mark_event_reminded(eid)
         # alarm·focus_session_end·proactive_checkin·system_notice·daily_journal·
-        # risk_predict 는 부수효과 없음.
+        # risk_predict·snooze_nudge 는 부수효과 없음.
 
     # ================================================== description 가이드 노트
     def _policy_recovery_note(self) -> str:

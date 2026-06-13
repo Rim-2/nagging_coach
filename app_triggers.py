@@ -29,6 +29,17 @@ _TRAIL_LEARN_TRIGGERS = {
     "개인 약점 앱", "도파민 좀비", "능동적 도파민 스크롤", "과몰입 딴짓",
 }
 
+# inline keyboard — 잔소리에 붙는 pattern-interrupt 버튼. 텍스트 알림을 스와이프로
+# 흘려보내는 습관을 깨고, 침묵 대신 *명시적 신호* (수락/미룸/거절)를 받는다.
+# callback_data="nag:action" → app._handle_nag_action 이 처리.
+NAG_KEYBOARD = {
+    "inline_keyboard": [[
+        {"text": "알겠어 👍", "callback_data": "nag:ack"},
+        {"text": "좀따 ⏰", "callback_data": "nag:snooze"},
+        {"text": "패스 🙅", "callback_data": "nag:pass"},
+    ]]
+}
+
 
 class TriggersMixin:
     """로컬·원격 트리거 처리 + 복합 룰 평가 + description 생성."""
@@ -46,6 +57,37 @@ class TriggersMixin:
         ("phone", "능동적 도파민 스크롤", "pc", "가짜 일하기"): "회피 패턴",
         ("phone", "과몰입 딴짓", "pc", "가짜 일하기"): "회피 패턴",
     }
+
+    # 메타 체크인 — 잔소리를 연속 N회 답 없이 흘려보내면, 또 잔소리하는 대신
+    # 한 발 물러나 '내 방식이 안 맞나?' 하고 직접 물어본다 (알림 습관화 대응).
+    _META_CHECKIN_IGNORED_THRESHOLD = 3
+    # 메타 메시지 자체가 또 다른 잔소리가 되지 않게, overload 점검과 같은 3일
+    # 쿨다운을 공유한다 (last_overload_checkin 기준).
+    _META_CHECKIN_COOLDOWN_SEC = 86400.0 * 3
+
+    # ====================================================== 메타 체크인
+    def _maybe_meta_checkin(self, chat_id: int) -> bool:
+        """무시 누적이 임계치를 넘었고 streak 안에서 아직 안 물어봤으면, 평소
+        잔소리 대신 메타 체크인(톤·목표 적합성 질문)을 보낸다. 보냈으면 True —
+        호출자는 이번 트리거의 잔소리를 생략한다. overload_checkin 생성기를 재사용
+        (메시지 내용이 정확히 '톤 빡센가/목표 무거운가' 질문)."""
+        if self._ignored_nags < self._META_CHECKIN_IGNORED_THRESHOLD:
+            return False
+        if self._meta_checkin_sent:
+            return False
+        last = self._store.last_overload_checkin
+        if last is not None and (time.time() - last) < self._META_CHECKIN_COOLDOWN_SEC:
+            return False
+        try:
+            reply = self._agent.overload_checkin()
+        except AIGenerationError as exc:
+            print(f"[App] 메타 체크인 생성 실패: {exc}")
+            return False
+        self._meta_checkin_sent = True
+        print(f"[App] 메타 체크인 발송 (누적 무시 {self._ignored_nags}회)")
+        # kind="overload_checkin" → 도달 시 last_overload_checkin 갱신 (쿨다운 공유).
+        self._send_or_enqueue(chat_id, reply, kind="overload_checkin")
+        return True
 
     # ====================================================== 로컬 트리거 (PC Tracker 콜백)
     def _on_trigger(self, trigger: TriggerType, snap: Snapshot) -> None:
@@ -78,6 +120,12 @@ class TriggersMixin:
                 return
             print(f"[App] 산만함 판독: 딴짓 확정 ({freq})")
 
+        # 잔소리를 연속으로 흘려보낸 흔적이 임계치를 넘으면, 또 잔소리하지 말고
+        # 한 발 물러나 메타로 물어본다 (보냈으면 이번 트리거는 여기서 종료).
+        if self._maybe_meta_checkin(chat_id):
+            self._tracker.resume_normal()
+            return
+
         snap_dict = {
             "active_window": snap.active_window,
             "idle_time": snap.idle_time,
@@ -102,7 +150,10 @@ class TriggersMixin:
             "weak_spot_candidate": label if (label and label != "other") else "",
             "mark_policy_asked": True,
         }
-        self._send_or_enqueue(chat_id, reply, kind="local_trigger", side_effects=se)
+        self._send_or_enqueue(
+            chat_id, reply, kind="local_trigger", side_effects=se,
+            reply_markup=NAG_KEYBOARD,
+        )
         self._arm_warning_timeout()
 
     # ====================================================== description (LLM 컨텍스트)
@@ -337,6 +388,10 @@ class TriggersMixin:
                 return {"ok": True, "action": "skipped", "reason": "ai_error"}
             print(f"[App] (원격) 산만함 판독: 딴짓 확정 ({freq})")
 
+        # 잔소리 누적 무시가 임계치를 넘으면 메타 체크인으로 대체 (한 발 물러남).
+        if self._maybe_meta_checkin(chat_id):
+            return {"ok": True, "action": "meta_checkin"}
+
         description = self._describe_trigger(trigger_value, snap, goal)
         description += self._escalation_note()
         description += self._policy_recovery_note()
@@ -355,7 +410,8 @@ class TriggersMixin:
             "mark_policy_asked": True,
         }
         delivered = self._send_or_enqueue(
-            chat_id, reply, kind="remote_trigger", side_effects=se
+            chat_id, reply, kind="remote_trigger", side_effects=se,
+            reply_markup=NAG_KEYBOARD,
         )
         self._arm_warning_timeout()
         if not delivered:
