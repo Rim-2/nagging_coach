@@ -5,6 +5,7 @@ import com.naggingcoach.satellite.BuildConfig;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.Manifest;
 import android.app.Service;
 import android.app.usage.UsageEvents;
 import android.app.usage.UsageStatsManager;
@@ -13,16 +14,19 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.ServiceInfo;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
 import android.location.Location;
+import android.location.LocationListener;
 import android.location.LocationManager;
 import android.media.AudioDeviceInfo;
 import android.media.AudioManager;
 import android.os.BatteryManager;
 import android.os.Build;
+import android.os.Bundle;
 import java.io.InputStream;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -108,6 +112,13 @@ public class TrackerService extends Service {
     private AudioManager audioManager;
     private LocationManager locationManager;
 
+    // 능동 측위 — getLastKnownLocation 은 캐시(다른 앱이 깨워둔)만 돌려주므로,
+    // NETWORK_PROVIDER 로 저빈도 업데이트를 직접 걸어 위치 캐시를 살아있게 한다.
+    // 콜백이 최신 fix 를 lastLocation 에 보관, matchPlaceCategory 가 우선 사용.
+    private Location lastLocation;
+    private static final long LOCATION_UPDATE_INTERVAL_MS = 5 * 60_000L;  // 5분
+    private static final float LOCATION_UPDATE_MIN_DISTANCE_M = 50f;       // 50m 이동 시
+
     // 등록된 장소 목록 — 1시간마다 백엔드 /places 에서 fetch. JSON 그대로 캐시.
     private JSONArray cachedPlaces = new JSONArray();
     private long placesFetchedAt = 0L;
@@ -182,9 +193,83 @@ public class TrackerService extends Service {
         }
     };
 
+    // minSdk 24 호환을 위해 LocationListener 의 콜백을 모두 명시 구현
+    // (compileSdk 34 에선 default 라 onLocationChanged 만 필수지만, 구형 기기
+    // 런타임 안전을 위해 나머지도 no-op 로 둔다).
+    private final LocationListener locationListener = new LocationListener() {
+        @Override
+        public void onLocationChanged(Location location) {
+            if (location != null) {
+                lastLocation = location;
+            }
+        }
+
+        @Override
+        public void onStatusChanged(String provider, int status, Bundle extras) {
+            // no-op
+        }
+
+        @Override
+        public void onProviderEnabled(String provider) {
+            // no-op
+        }
+
+        @Override
+        public void onProviderDisabled(String provider) {
+            // no-op
+        }
+    };
+
+    /** 위치 권한이 있으면 NETWORK_PROVIDER 로 저빈도 능동 측위를 건다.
+     *  권한·provider 없으면 조용히 skip (위성은 그대로 동작, 장소 감지만 빠짐). */
+    private boolean hasLocationPermission() {
+        return checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+                    == PackageManager.PERMISSION_GRANTED
+                || checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                    == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void startLocationUpdates() {
+        if (locationManager == null) return;
+        if (!hasLocationPermission()) {
+            Log.i(TAG, "location permission not granted — place detection disabled");
+            return;
+        }
+        try {
+            // NETWORK 만 — 집/회사/카페 200m 반경엔 충분하고 배터리도 가볍다.
+            // GPS_PROVIDER 의 마지막 fix 는 matchPlaceCategory 가 별도로 같이 읽는다.
+            if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+                locationManager.requestLocationUpdates(
+                        LocationManager.NETWORK_PROVIDER,
+                        LOCATION_UPDATE_INTERVAL_MS,
+                        LOCATION_UPDATE_MIN_DISTANCE_M,
+                        locationListener,
+                        Looper.getMainLooper());
+                Log.i(TAG, "location updates requested (NETWORK)");
+            } else {
+                Log.i(TAG, "NETWORK provider disabled — relying on last-known only");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "requestLocationUpdates failed", t);
+        }
+    }
+
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        startForeground(NOTI_ID, buildNotification("폰 활동 감시 중"));
+        // FGS 타입은 *실제 보유 권한에 맞춰* 동적으로 — targetSdk 34 에선 위치
+        // 권한 없이 location 타입으로 startForeground 하면 SecurityException 으로
+        // 죽는다. 위치 거부 시엔 dataSync 만 선언해 안전하게 가동.
+        Notification noti = buildNotification("폰 활동 감시 중");
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            int fgsType = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC;
+            if (hasLocationPermission()) {
+                fgsType |= ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION;
+            }
+            startForeground(NOTI_ID, noti, fgsType);
+        } else {
+            startForeground(NOTI_ID, noti);
+        }
+        startLocationUpdates();
         handler.removeCallbacks(poller);
         handler.post(poller);
         Log.i(TAG, "TrackerService started");
@@ -198,6 +283,13 @@ public class TrackerService extends Service {
         if (sensorManager != null && stepCounter != null) {
             try {
                 sensorManager.unregisterListener(stepListener);
+            } catch (Throwable t) {
+                // ignore
+            }
+        }
+        if (locationManager != null) {
+            try {
+                locationManager.removeUpdates(locationListener);
             } catch (Throwable t) {
                 // ignore
             }
@@ -466,6 +558,11 @@ public class TrackerService extends Service {
                     best = gps;
                 } else {
                     best = net;
+                }
+                // 능동 측위로 받아둔 fix 가 더 최신이면 그걸 우선.
+                if (lastLocation != null
+                        && (best == null || lastLocation.getTime() > best.getTime())) {
+                    best = lastLocation;
                 }
             }
         } catch (Throwable t) {
