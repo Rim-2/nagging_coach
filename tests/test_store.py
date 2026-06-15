@@ -233,3 +233,43 @@ class TestTodayGoalsCounting:
         result = fresh_store.advance_today_goal("발표")
         # 둘 다 substring 매칭 → 모호 → None
         assert result is None
+
+
+# ----------------------------------------------------------- lifetime_steps (걸음)
+class TestLifetimeSteps:
+    def test_starts_zero(self, fresh_store):
+        assert fresh_store.lifetime_steps == 0
+
+    def test_sub_step_advance_increments(self, fresh_store):
+        fresh_store.add_today_goal("코딩", sub_steps=["a", "b", "c"])
+        fresh_store.advance_today_goal("코딩")
+        assert fresh_store.lifetime_steps == 1
+        fresh_store.advance_today_goal("코딩")
+        assert fresh_store.lifetime_steps == 2
+
+    def test_final_advance_counts_one_not_two(self, fresh_store):
+        # 마지막 단계로 목표가 완료돼도 그 advance 호출은 1걸음 (이중계상 X)
+        fresh_store.add_today_goal("코딩", sub_steps=["a", "b"])
+        fresh_store.advance_today_goal("코딩")
+        r = fresh_store.advance_today_goal("코딩")
+        assert r["completed"] is True
+        assert fresh_store.lifetime_steps == 2
+
+    def test_complete_no_substep_goal_increments(self, fresh_store):
+        fresh_store.add_today_goal("청소")
+        fresh_store.complete_today_goal("청소")
+        assert fresh_store.lifetime_steps == 1
+
+    def test_habit_done_increments_once_per_day(self, fresh_store):
+        fresh_store.add_habit("독서", ["10분", "20분"])
+        fresh_store.mark_habit_done("독서")
+        assert fresh_store.lifetime_steps == 1
+        fresh_store.mark_habit_done("독서")  # 같은 날 재호출
+        assert fresh_store.lifetime_steps == 1  # 중복 증가 안 함
+
+    def test_weekly_summary_exposes_sub_step_advances(self, fresh_store):
+        fresh_store.add_today_goal("코딩", sub_steps=["a", "b", "c"])
+        fresh_store.advance_today_goal("코딩")
+        fresh_store.advance_today_goal("코딩")
+        rec = fresh_store.weekly_summary(days=7)["recent"]
+        assert rec["sub_step_advances"] == 2

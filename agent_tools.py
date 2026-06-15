@@ -723,6 +723,22 @@ def _register_today_goal_with_steps(
     return f"이미 등록된 오늘 목표다: '{name}'."
 
 
+def _progress_bar(current: int, total: int) -> str:
+    """▰(찬 칸)/▱(빈 칸) 진척 바. total 이 10 초과면 10칸으로 스케일."""
+    if total <= 0:
+        return ""
+    segments = total if total <= 10 else 10
+    filled = round(current / total * segments)
+    filled = max(0, min(segments, filled))
+    return "▰" * filled + "▱" * (segments - filled)
+
+
+def _step_milestone(lifetime: int) -> bool:
+    """누적 걸음이 라운드 마일스톤(10, 이후 25 단위)인지. 걸음은 1씩 늘므로
+    현재 값만 봐도 충분. 비처벌적 — 도달하면 한 번 더 축하."""
+    return lifetime == 10 or (lifetime >= 25 and lifetime % 25 == 0)
+
+
 def _advance_today_goal_step(store, args: dict) -> str:
     name = str(args.get("name", "")).strip()
     if not name:
@@ -730,14 +746,22 @@ def _advance_today_goal_step(store, args: dict) -> str:
     result = store.advance_today_goal(name)
     if result is None:
         return f"실패: '{name}' 에 매칭되는 sub_step 등록 과제가 없다."
+    bar = _progress_bar(result["current"], result["total"])
+    lifetime = store.lifetime_steps
+    milestone = (
+        f" 🎉 누적 {lifetime}걸음 달성 — 특별히 한 번 더 축하!"
+        if _step_milestone(lifetime) else ""
+    )
     if result["completed"]:
         return (
-            f"성공: '{name}' 의 마지막 단계까지 끝났어 — 과제 자체가 완료됐다. "
-            f"({result['current']}/{result['total']})"
+            f"성공: '{name}' 완료! {bar} ({result['total']}/{result['total']}). "
+            f"누적 {lifetime}걸음.{milestone} "
+            "→ 마지막 단계까지 끝났어. 이 진척바를 보여주며 크게·따뜻하게 축하해."
         )
     return (
-        f"성공: '{name}' 진척 {result['current']}/{result['total']}. "
-        f"다음 행동: '{result['next_step']}'."
+        f"성공: '{name}' {bar} ({result['current']}/{result['total']}). "
+        f"누적 {lifetime}걸음.{milestone} 다음 행동: '{result['next_step']}'. "
+        "→ 이 진척바와 한 발 내디딘 걸 짧고 신나게 축하하며 보여줘 (과하지 않게)."
     )
 
 

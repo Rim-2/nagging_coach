@@ -38,6 +38,7 @@ def _aggregate_buckets(buckets: List[dict]) -> dict:
     goals_completed = 0
     goals_registered = 0
     habit_dones = 0
+    sub_step_advances = 0
     mood_ratings: List[int] = []
     mood_notes: List[str] = []
     for b in buckets:
@@ -46,6 +47,7 @@ def _aggregate_buckets(buckets: List[dict]) -> dict:
         goals_completed += int(b.get("goals_completed") or 0)
         goals_registered += int(b.get("goals_registered") or 0)
         habit_dones += int(b.get("habit_dones") or 0)
+        sub_step_advances += int(b.get("sub_step_advances") or 0)
         for log in (b.get("mood_logs") or []):
             try:
                 mood_ratings.append(int(log.get("rating", 0)))
@@ -71,6 +73,7 @@ def _aggregate_buckets(buckets: List[dict]) -> dict:
         "goals_registered": goals_registered,
         "completion_rate": completion_rate,
         "habit_dones": habit_dones,
+        "sub_step_advances": sub_step_advances,
         "mood_avg": mood_avg,
         "mood_count": len(mood_ratings),
         "mood_notes_recent": mood_notes[-3:],  # 가장 최근 3개 메모
@@ -105,6 +108,9 @@ class Store:
             # '톤 복귀' 코멘트를 끼우기 위한 1회용 플래그. 소비 후 자동 False.
             "nag_policy_recovery_pending": False,
             "daily_stats": {},
+            # 누적 '걸음' — sub_step 진척·목표 완료·습관 수행을 한 발씩 누적.
+            # 절대 줄지 않는다 (성취감 보상; streak 처럼 끊겨 0 되는 부담 없음).
+            "lifetime_steps": 0,
             "last_weekly_review": None,
             "last_overload_checkin": None,
             "last_late_night_fired": None,  # YYYY-MM-DD — 하루 한 번 제약 영속화
@@ -332,6 +338,8 @@ class Store:
                 self._data["today_goals"] = [
                     g for g in self._data["today_goals"] if g is not target
                 ]
+            # 한 발 전진 = 누적 걸음 +1 (마지막 단계로 완료돼도 이 호출은 1걸음).
+            self._data["lifetime_steps"] = int(self._data.get("lifetime_steps", 0)) + 1
             self._persist()
             return result
 
@@ -353,8 +361,15 @@ class Store:
             bucket["hourly_goals_completed"][hk] = (
                 bucket["hourly_goals_completed"].get(hk, 0) + 1
             )
+            # 목표 완료 = 누적 걸음 +1 (sub_step 없는 목표를 바로 완료한 경로).
+            self._data["lifetime_steps"] = int(self._data.get("lifetime_steps", 0)) + 1
             self._persist()
             return True
+
+    @property
+    def lifetime_steps(self) -> int:
+        """누적 '걸음' 수 — sub_step 진척·목표 완료·습관 수행의 총합. 절대 줄지 않음."""
+        return int(self._get("lifetime_steps") or 0)
 
     @property
     def long_term_goal(self) -> Optional[str]:
@@ -1297,6 +1312,8 @@ class Store:
                 bucket["hourly_habit_dones"][hk] = (
                     bucket["hourly_habit_dones"].get(hk, 0) + 1
                 )
+                # 습관 수행 = 누적 걸음 +1 (하루 1회 분기 안 → 같은 날 중복 증가 X).
+                self._data["lifetime_steps"] = int(self._data.get("lifetime_steps", 0)) + 1
                 self._persist()
 
             levels = habit.get("levels") or []
