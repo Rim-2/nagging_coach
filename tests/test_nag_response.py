@@ -92,6 +92,34 @@ class _MetaApp:
         return True
 
 
+# ----------------------------------------------------------- escalation note
+class _EscApp:
+    """_escalation_note 만 흉내 — store.active_nag_policy 페이크."""
+
+    _escalation_note = app_mod.CoachApp._escalation_note
+
+    def __init__(self, ignored, policy):
+        self._ignored_nags = ignored
+        self._store = types.SimpleNamespace(active_nag_policy=policy)
+
+
+class TestEscalationNote:
+    def test_no_note_when_not_ignored(self):
+        assert _EscApp(0, "balanced")._escalation_note() == ""
+
+    @pytest.mark.parametrize("policy", ["gentle", "balanced", "strict"])
+    def test_first_ignore_leads_to_small_step_all_policies(self, policy):
+        note = _EscApp(1, policy)._escalation_note()
+        # 첫 무시부터 분해 방향 — 압박(쪼아라)이 아니라 쪼개기
+        assert "작게" in note
+        assert "register_today_goal_with_steps" in note
+        assert "쪼아라" not in note   # 압박 어휘는 더 이상 안 씀
+
+    def test_high_ignore_removes_pressure(self):
+        note = _EscApp(4, "balanced")._escalation_note()
+        assert "압박은 완전히 빼" in note or "안부" in note
+
+
 class TestMetaCheckin:
     def test_below_threshold_does_not_fire(self):
         app = _MetaApp(ignored=2)
