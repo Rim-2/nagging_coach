@@ -627,9 +627,13 @@ class CoachAgent:
             self._chat = self._new_chat()
 
     # ===================================================== 대화 처리
-    def chat(self, user_text: str) -> str:
-        """사용자가 텔레그램으로 보낸 메시지를 처리하고 코치 응답을 돌려준다."""
+    def chat(self, user_text: str, *, system_note: Optional[str] = None) -> str:
+        """사용자가 텔레그램으로 보낸 메시지를 처리하고 코치 응답을 돌려준다.
+        system_note 가 있으면 이번 turn 한정으로 코치에게 귀띔하는 시스템 참고를
+        앞에 끼운다 (예: 밤잠 추론 '자다 깸?' 확인)."""
         with self._lock:
+            if system_note:
+                return self._turn(f"[시스템 참고: {system_note}]\n{user_text}")
             return self._turn(user_text)
 
     def handle_event(self, description: str) -> str:

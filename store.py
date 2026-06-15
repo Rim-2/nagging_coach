@@ -110,6 +110,7 @@ class Store:
             "last_late_night_fired": None,  # YYYY-MM-DD — 하루 한 번 제약 영속화
             "last_risk_predict": None,      # {"date": YYYY-MM-DD, "hour": int} — 1일 1회 가드
             "last_daily_journal": None,     # YYYY-MM-DD — 하루 마무리 일지 1일 1회 가드
+            "last_user_message_at": 0.0,    # epoch — 마지막 사용자 메시지 시각 (밤잠 추론용, 재시작 영속)
             "implementation_intentions": [],
             "weak_spot_candidates": {},
             # 도파민 trail 학습 — 딴짓 트리거 직전 sanitized 라벨 시퀀스 N-gram
@@ -1032,6 +1033,18 @@ class Store:
     @last_daily_journal.setter
     def last_daily_journal(self, value: Optional[str]) -> None:
         self._set("last_daily_journal", value)
+
+    # ----------------------------------------------------- 마지막 사용자 메시지 시각
+    @property
+    def last_user_message_at(self) -> float:
+        """마지막으로 사용자가 메시지를 보낸 epoch 시각. 0 이면 미설정.
+        밤잠 추론(긴 침묵 후 첫 메시지 = 자다 깸)에 쓰며, 4시 재시작에도
+        살아남도록 영속화한다."""
+        return float(self._get("last_user_message_at") or 0.0)
+
+    @last_user_message_at.setter
+    def last_user_message_at(self, value: float) -> None:
+        self._set("last_user_message_at", float(value))
 
     # ----------------------------------------------------- 위험 예측 1일 1회
     def risk_predict_already_fired_today(self) -> bool:

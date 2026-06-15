@@ -69,6 +69,15 @@ STATE_PATH = os.getenv("STATE_PATH") or os.path.join(
 
 WARNING_TIMEOUT_SEC = 600.0       # 잔소리 후 응답 없으면 10분 뒤 감시 자동 정상화
 SNOOZE_SEC = 20 * 60.0            # 잔소리 '좀따 ⏰' 버튼 → 20분 뒤 가볍게 재알림
+
+# 밤잠 추론 — 폰이 화면 OFF 동안 아무 신호도 안 보내서 백엔드는 수면을 직접
+# 못 본다. 그래서 '마지막 메시지 이후 긴 침묵 + 아침 시간대' 를 자다 깸 후보로
+# 보고, 단정 대신 '자다 일어났어?' 하고 한 번 물어본다 (확인 후 처리).
+WAKE_GAP_MIN_SEC = 3 * 3600.0     # 이 이상 침묵 후 첫 메시지여야 밤잠 후보
+WAKE_GAP_MAX_SEC = 16 * 3600.0    # 너무 길면(며칠) 밤잠으로 안 봄
+MORNING_WAKE_START_HOUR = 4       # 자다 깬 걸로 볼 아침 시간대 [start, end)
+MORNING_WAKE_END_HOUR = 12
+WAKE_DETECTED_GRACE_SEC = 2 * 3600.0  # 깸 감지 후 '늦은 밤' 수면 잔소리 억제 창
 AI_FAILURE_WARN_THRESHOLD = 3     # 연속 N회 실패 시 사용자에게 시스템 경고
 RESET_CONFIRM_TTL = 60.0          # /reset 첫 명령 후 N초 안에 한 번 더 보내야 실행
 CHAT_DEBOUNCE_SEC = 1.5           # 사용자 chat 짧은 간격 우다다 → 묶어서 한 번에 답장
@@ -135,6 +144,8 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
         self._ignored_nags = 0               # 연속으로 무시당한 잔소리 횟수
         self._meta_checkin_sent = False      # 현재 무시 streak 에서 메타 체크인 보냈는지
         self._snooze_timer: Optional[threading.Timer] = None  # '좀따' 재알림 타이머
+        self._pending_wake_check: Optional[int] = None  # 다음 chat flush 때 '자다 깸?' 물을지 (경과 시간)
+        self._last_wake_detected_at = 0.0    # 마지막으로 '자다 깸' 감지한 시각 (늦은 밤 잔소리 억제용)
         self._remote_cooldowns: dict[str, float] = {}  # trigger_value → 다음 발동 가능 시각
         self._remote_cooldown_lock = threading.Lock()
         # quiet_mode 중 보류 카운트 dedup — trigger_value → 다음 카운트 가능 시각.
@@ -616,10 +627,46 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
 
         return "\n".join(lines)
 
+    # =================================================== 밤잠 추론
+    def _user_silence_sec(self) -> float:
+        """마지막 사용자 메시지 이후 경과(초). 미설정이면 0."""
+        last = self._store.last_user_message_at
+        return max(0.0, time.time() - last) if last > 0 else 0.0
+
+    def _detect_wake_on_message(self) -> Optional[int]:
+        """사용자 메시지 도착 *직전* 에 호출 (last_user_message_at 갱신 전).
+        직전 메시지 이후 경과가 밤잠 범위 + 아침 시간대면 '자다 깸' 으로 보고
+        경과 시간(시)을 반환 + 깸 시각 기록. 아니면 None."""
+        gap = self._user_silence_sec()
+        if gap <= 0:
+            return None
+        if not (WAKE_GAP_MIN_SEC <= gap <= WAKE_GAP_MAX_SEC):
+            return None
+        hour = time.localtime().tm_hour
+        if not (MORNING_WAKE_START_HOUR <= hour < MORNING_WAKE_END_HOUR):
+            return None
+        self._last_wake_detected_at = time.time()
+        return int(gap // 3600)
+
+    def _should_skip_late_night_as_woke(self) -> bool:
+        """'늦은 밤' 수면 잔소리 직전 호출. 방금 깸을 감지했거나(최근 grace 창)
+        한참 조용했으면(밤잠) True — 자다 깬 사람한테 '안 자고 뭐해' 는 역효과라
+        보류한다. 메시지/트리거 도착 순서와 무관하게 둘 중 하나로 잡힌다."""
+        if time.time() - self._last_wake_detected_at < WAKE_DETECTED_GRACE_SEC:
+            return True
+        return self._user_silence_sec() > WAKE_GAP_MIN_SEC
+
     def _handle_chat(self, chat_id: int, text: str) -> None:
         """사용자 chat 메시지 도착 → 짧은 debounce 후 LLM 호출. 같은 debounce
         창 안에 추가 메시지가 오면 버퍼에 누적되어 *한 번에* 묶여 답장된다."""
+        # 밤잠 추론은 last_user_message_at 갱신 *전* 에 — 긴 침묵 후 첫 메시지면
+        # '자다 깸?' 을 다음 flush 때 물어본다. 단, 취침 모드를 직접 선언한
+        # 경우엔 이미 아니까 묻지 않는다 (아래 auto-exit 이 안내).
+        woke_hours = self._detect_wake_on_message()
+        if woke_hours is not None and self._store.quiet_mode != "sleep":
+            self._pending_wake_check = woke_hours
         self._last_user_msg = time.time()
+        self._store.last_user_message_at = time.time()
         # 취침 모드면 사용자가 답한 것 = 깨어남. 자동 해제 + 안내.
         # (외출 모드는 사용자 발화에 "왔어/들어왔어" 가 있을 때 EXTRACT 가 잡아 해제.)
         if self._store.quiet_mode == "sleep":
@@ -659,8 +706,20 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
         # 여러 통이면 줄바꿈으로 합쳐 한 컨텍스트로 전달. LLM 은 한 사람이 연달아
         # 보낸 메시지 묶음으로 자연스럽게 인식한다.
         combined = "\n".join(messages) if len(messages) > 1 else messages[0]
+        # 밤잠 추론 — 긴 침묵 후 첫 메시지면 코치가 '자다 일어났어?' 하고 부드럽게
+        # 한 번 확인하도록 시스템 노트로 귀띔 (단정 X). 한 번 소비하고 내린다.
+        wake_note = None
+        woke_hours = self._pending_wake_check
+        self._pending_wake_check = None
+        if woke_hours is not None:
+            wake_note = (
+                f"사용자가 약 {woke_hours}시간 만에 보낸 첫 메시지야. 밤사이 자고 "
+                "일어난 걸 수 있어 — 단정하지 말고 '자다 일어난 거야?' 하고 부드럽게 "
+                "한 번 확인해. 맞으면 잘 잤는지 가볍게 챙기고, 밤새운 거 아니냐는 "
+                "잔소리는 하지 마."
+            )
         try:
-            reply = self._agent.chat(combined)
+            reply = self._agent.chat(combined, system_note=wake_note)
         except AIGenerationError as exc:
             self._note_ai_failure(chat_id, exc)
             return

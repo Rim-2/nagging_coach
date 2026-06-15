@@ -333,7 +333,7 @@ ENABLE_PC_TRACKER=false
 | `agent_tools.py` | 도구 레지스트리 (17~19종) |
 | `tracker.py` | PC 활동 감시 + 9종 딴짓 트리거 (Pomodoro 포함) + 생산성 가드 + 화면 라벨 sanitize |
 | `store.py` | 상태 영속화 — 목표·습관·프로필·values·if-then·daily_stats (시간대 매핑 포함)·mood·events·weak_spot 후보·pending_messages 큐·dopamine_trails·nag_policy_temp |
-| `tests/` | pytest 단위 테스트 (54개) — store/tracker/복합 트리거/잔소리 응답·메타 체크인·무시 대응 |
+| `tests/` | pytest 단위 테스트 (61개) — store/tracker/복합 트리거/잔소리 응답·메타 체크인·무시 대응·밤잠 추론 |
 | `calendar_client.py` / `calendar_setup.py` | Google 캘린더 클라이언트 · OAuth 인증 |
 | `telegram_client.py` | 텔레그램 Bot API (long-polling) |
 | `Dockerfile` / `requirements-docker.txt` | Railway 클라우드 봇 빌드 |
@@ -385,7 +385,8 @@ ENABLE_PC_TRACKER=false
 - **알림 습관화 대응 (pattern-interrupt)** — 잔소리에 inline 버튼(`알겠어 👍`/`좀따 ⏰`/`패스 🙅`) 부착. 스와이프로 흘려보내던 알림을 한 번의 탭으로 전환하고, 침묵 대신 *명시적 신호*(수락/미룸/거절)를 받는다. `좀따`는 20분 뒤 가벼운 재알림으로 미루기를 약속으로 바꾸고, `패스`는 거절로 받아 다그치지 않고 물러난다
 - **메타 체크인** — 잔소리를 연속 3회 답 없이 흘려보내면, 또 잔소리하는 대신 한 발 물러나 "톤이 빡센가? 목표가 무겁나?" 하고 직접 물어본다 (한 streak 1회, overload 점검과 3일 쿨다운 공유 — 메타 메시지 자체가 잔소리가 되지 않게)
 - **무시 → 스몰스텝 전환** — 잔소리를 흘려보내면 *시작 장벽이 높다*는 신호로 읽고, 다음 잔소리는 압박을 올리지 않고 **요구 크기를 줄인다** (2~5분짜리 한 조각 / `register_today_goal_with_steps` 분해). 정책과 무관하게 첫 무시부터 적용, nag_policy 는 톤 세기만 조절 (이전엔 balanced/strict 가 초반에 압박을 *올려서* 부담을 키우던 걸 교정)
-- 단위 테스트 54개 (store · tracker · 복합 트리거 · 잔소리 응답 · 메타 체크인 · 무시 대응)
+- **밤잠 추론** — 폰은 화면 OFF 동안 신호를 안 보내 백엔드가 수면을 직접 못 본다. `last_user_message_at` 기준으로 *긴 침묵(3~16h) + 아침 시간대* 면 자다 깬 걸로 보고, 단정 대신 "자다 일어난 거야?" 하고 **묻는다** (확인 후 처리). 자다 깬 직후엔 "늦은 밤" 수면 잔소리 보류, proactive 는 야간(0~7시) 전면 보류
+- 단위 테스트 61개 (store · tracker · 복합 트리거 · 잔소리 응답 · 메타 체크인 · 무시 대응 · 밤잠 추론)
 - `app.py` god class → `HttpServerMixin` · `MessagingMixin` · `TriggersMixin` · `LoopsMixin` 모듈 분리 (1583 → 601줄)
 
 백엔드는 이미 `POST /trigger` 한 엔드포인트로 모든 클라이언트를 받는 구조라, 새 디바이스 (스마트워치 등) 추가도 같은 패턴으로 가능.

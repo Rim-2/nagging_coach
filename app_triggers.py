@@ -383,6 +383,11 @@ class TriggersMixin:
         # 늦은 밤 트리거 — 하루 한 번만. 위성 메모리 변수의 재시작 리셋을 막기
         # 위해 백엔드가 영속 마크로 차단 (트리거 종류별 10분 쿨다운보다 강한 제약).
         if trigger_value == "늦은 밤":
+            # 자다 깬 직후면 '안 자고 뭐해' 는 역효과 → 보류. 화면 켜서 트리거가
+            # 와도, 한참 조용했거나 방금 깸 감지됐으면 밤새운 게 아니라 깬 거.
+            if self._should_skip_late_night_as_woke():
+                print("[App] (원격) 늦은 밤 — 한참 조용했다 깬 신호 → 수면 잔소리 보류")
+                return {"ok": True, "action": "skipped", "reason": "just_woke"}
             today_s = datetime.datetime.now().date().isoformat()
             if self._store.last_late_night_fired == today_s:
                 print(f"[App] (원격) 늦은 밤 트리거 — 오늘 이미 발사됨, 스킵")

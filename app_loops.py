@@ -48,6 +48,9 @@ class LoopsMixin:
     # 프로액티브 — 1시간 침묵 시 먼저 말 걸기
     PROACTIVE_IDLE_SEC = 3600.0
     PROACTIVE_CHECK_INTERVAL = 120.0
+    # 야간엔 먼저 말 걸지 않는다 (자는 시간 — 새벽 '뭐해' 핑 방지) [start, end)
+    PROACTIVE_NIGHT_START_HOUR = 0
+    PROACTIVE_NIGHT_END_HOUR = 7
     # 일정 리마인더
     REMINDER_LEAD_MIN = 15.0
     REMINDER_CHECK_INTERVAL = 120.0
@@ -79,6 +82,11 @@ class LoopsMixin:
         while not self._stop.wait(self.PROACTIVE_CHECK_INTERVAL):
             chat_id = self._store.chat_id
             if chat_id is None:
+                continue
+            # 야간(자는 시간)엔 먼저 말 걸지 않는다 — 새벽 '뭐해 조용하네' 핑은
+            # 무의미하고 수면 방해. 늦은 밤 '자라' 잔소리는 별도 트리거가 담당.
+            hour = datetime.datetime.now().hour
+            if self.PROACTIVE_NIGHT_START_HOUR <= hour < self.PROACTIVE_NIGHT_END_HOUR:
                 continue
             # SLEEP(완료) 또는 WARNING(잔소리 중)이면 먼저 말 걸지 않는다.
             # Tracker 가 꺼져 있으면 상태 개념이 없으므로 그대로 진행한다.
