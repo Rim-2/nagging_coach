@@ -38,6 +38,7 @@ from app_loops import LoopsMixin
 from app_messaging import MessagingMixin
 from app_triggers import NAG_KEYBOARD, TriggersMixin
 from calendar_client import CalendarClient
+from presence import Presence
 from store import Store
 from telegram_client import TelegramClient
 
@@ -70,17 +71,8 @@ STATE_PATH = os.getenv("STATE_PATH") or os.path.join(
 WARNING_TIMEOUT_SEC = 600.0       # 잔소리 후 응답 없으면 10분 뒤 감시 자동 정상화
 SNOOZE_SEC = 20 * 60.0            # 잔소리 '좀따 ⏰' 버튼 → 20분 뒤 가볍게 재알림
 
-# 밤잠 추론 — 폰이 화면 OFF 동안 아무 신호도 안 보내서 백엔드는 수면을 직접
-# 못 본다. 그래서 '마지막 메시지 이후 긴 침묵 + 아침 시간대' 를 자다 깸 후보로
-# 보고, 단정 대신 '자다 일어났어?' 하고 한 번 물어본다 (확인 후 처리).
-WAKE_GAP_MIN_SEC = 3 * 3600.0     # 이 이상 침묵 후 첫 메시지여야 밤잠 후보
-WAKE_GAP_MAX_SEC = 16 * 3600.0    # 너무 길면(며칠) 밤잠으로 안 봄
-MORNING_WAKE_START_HOUR = 4       # 자다 깬 걸로 볼 아침 시간대 [start, end)
-MORNING_WAKE_END_HOUR = 12
-WAKE_DETECTED_GRACE_SEC = 2 * 3600.0  # 깸 감지 후 '늦은 밤' 수면 잔소리 억제 창
-# 폰이 직접 보고한 '직전까지 화면 OFF 지속(screen_off_sec)' 이 이 이상이면 자다 깸.
-# (휴리스틱보다 정확 — 폰이 화면 OFF 길이를 트리거에 동봉. 구버전 APK 면 None.)
-SLEEP_SCREEN_OFF_SEC = 90 * 60.0
+# 밤잠 추론 (수면/기상/활동 판단)은 presence.Presence 로 분리 — 임계 상수·시간대
+# 정의가 한 곳에 모여 있다. CoachApp 은 self._presence 로 위임만 한다.
 AI_FAILURE_WARN_THRESHOLD = 3     # 연속 N회 실패 시 사용자에게 시스템 경고
 RESET_CONFIRM_TTL = 60.0          # /reset 첫 명령 후 N초 안에 한 번 더 보내야 실행
 CHAT_DEBOUNCE_SEC = 1.5           # 사용자 chat 짧은 간격 우다다 → 묶어서 한 번에 답장
@@ -148,8 +140,7 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
         self._meta_checkin_sent = False      # 현재 무시 streak 에서 메타 체크인 보냈는지
         self._snooze_timer: Optional[threading.Timer] = None  # '좀따' 재알림 타이머
         self._pending_wake_check: Optional[int] = None  # 다음 chat flush 때 '자다 깸?' 물을지 (경과 시간)
-        self._last_wake_detected_at = 0.0    # 마지막으로 '자다 깸' 감지한 시각 (늦은 밤 잔소리 억제용)
-        self._last_device_activity_at = 0.0  # 마지막 폰/PC 트리거 시각 — '깨어있음' 증거 (자는중 vs 폰하는중 구분)
+        self._presence = Presence(self._store)  # 수면/기상/활동 추론 (단일 주인)
         self._remote_cooldowns: dict[str, float] = {}  # trigger_value → 다음 발동 가능 시각
         self._remote_cooldown_lock = threading.Lock()
         # quiet_mode 중 보류 카운트 dedup — trigger_value → 다음 카운트 가능 시각.
@@ -631,64 +622,16 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
 
         return "\n".join(lines)
 
-    # =================================================== 밤잠 추론
-    def _user_silence_sec(self) -> float:
-        """마지막 사용자 메시지 이후 경과(초). 미설정이면 0."""
-        last = self._store.last_user_message_at
-        return max(0.0, time.time() - last) if last > 0 else 0.0
-
-    def _device_silence_sec(self) -> float:
-        """마지막 폰/PC 트리거(=기기 활동) 이후 경과(초). 기록 없으면 inf.
-        '기기가 한참 잠잠 = 화면 OFF = 자는 중' 을 가늠하는 신호. 짧으면
-        '폰 하느라 깨어 있음'."""
-        last = self._last_device_activity_at
-        return (time.time() - last) if last > 0 else float("inf")
-
-    def _detect_wake_on_message(self) -> Optional[int]:
-        """사용자 메시지 도착 *직전* 에 호출 (last_user_message_at 갱신 전).
-        메시지 침묵이 밤잠 범위 + 아침 시간대 + 기기도 한참 잠잠(딴짓 중 아님)
-        이면 '자다 깸' 으로 보고 경과 시간(시) 반환 + 깸 시각 기록. 아니면 None."""
-        gap = self._user_silence_sec()
-        if gap <= 0 or not (WAKE_GAP_MIN_SEC <= gap <= WAKE_GAP_MAX_SEC):
-            return None
-        hour = time.localtime().tm_hour
-        if not (MORNING_WAKE_START_HOUR <= hour < MORNING_WAKE_END_HOUR):
-            return None
-        # 폰을 계속 쓰고 있었으면(딴짓) 자다 깬 게 아니다 — 묻지 않는다.
-        if self._device_silence_sec() <= WAKE_GAP_MIN_SEC:
-            return None
-        self._last_wake_detected_at = time.time()
-        return int(gap // 3600)
-
-    def _should_skip_late_night_as_woke(
-        self, device_silence_sec: float, screen_off_sec: Optional[float] = None
-    ) -> bool:
-        """'늦은 밤' 수면 잔소리 직전 호출. 방금 깸을 감지했거나 자다 깬 직후면
-        True → 보류 (자는 사람한테 '안 자고 뭐해' 는 역효과). 계속 폰 하던 중이면
-        False → 발사 (밤샘은 잡아야 함).
-
-        판단 우선순위:
-          1) 아침 인사로 깸이 막 감지됨 → True
-          2) 폰이 직접 보고한 screen_off_sec 이 있으면 그게 가장 정확 — 임계 이상
-             이면 자다 깸(True), 짧으면 계속 폰 함(False)
-          3) 폰 신호 없으면(구버전 APK) 기기 침묵 휴리스틱 폴백"""
-        if time.time() - self._last_wake_detected_at < WAKE_DETECTED_GRACE_SEC:
-            return True
-        if screen_off_sec is not None:
-            return screen_off_sec >= SLEEP_SCREEN_OFF_SEC
-        return device_silence_sec > WAKE_GAP_MIN_SEC
-
     def _handle_chat(self, chat_id: int, text: str) -> None:
         """사용자 chat 메시지 도착 → 짧은 debounce 후 LLM 호출. 같은 debounce
         창 안에 추가 메시지가 오면 버퍼에 누적되어 *한 번에* 묶여 답장된다."""
-        # 밤잠 추론은 last_user_message_at 갱신 *전* 에 — 긴 침묵 후 첫 메시지면
-        # '자다 깸?' 을 다음 flush 때 물어본다. 단, 취침 모드를 직접 선언한
-        # 경우엔 이미 아니까 묻지 않는다 (아래 auto-exit 이 안내).
-        woke_hours = self._detect_wake_on_message()
+        # 밤잠 추론은 last_user_message_at 갱신 *전* 에 판정 (presence 가 내부 처리).
+        # 긴 침묵 후 첫 메시지면 '자다 깸?' 을 다음 flush 때 물어본다. 단, 취침
+        # 모드를 직접 선언한 경우엔 이미 아니까 묻지 않는다 (아래 auto-exit 이 안내).
+        woke_hours = self._presence.note_user_message()
         if woke_hours is not None and self._store.quiet_mode != "sleep":
             self._pending_wake_check = woke_hours
         self._last_user_msg = time.time()
-        self._store.last_user_message_at = time.time()
         # 취침 모드면 사용자가 답한 것 = 깨어남. 자동 해제 + 안내.
         # (외출 모드는 사용자 발화에 "왔어/들어왔어" 가 있을 때 EXTRACT 가 잡아 해제.)
         if self._store.quiet_mode == "sleep":

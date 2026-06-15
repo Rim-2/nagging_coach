@@ -13,6 +13,7 @@ import types
 import pytest
 
 import app as app_mod
+from presence import Presence
 
 
 # ----------------------------------------------------------- nag 버튼 응답
@@ -120,66 +121,74 @@ class TestEscalationNote:
         assert "압박은 완전히 빼" in note or "안부" in note
 
 
-# ----------------------------------------------------------- 밤잠 추론
-class _WakeApp:
-    """밤잠 추론 헬퍼만 흉내 — store.last_user_message_at + 기기 활동 시각 페이크."""
-
-    _user_silence_sec = app_mod.CoachApp._user_silence_sec
-    _device_silence_sec = app_mod.CoachApp._device_silence_sec
-    _detect_wake_on_message = app_mod.CoachApp._detect_wake_on_message
-    _should_skip_late_night_as_woke = app_mod.CoachApp._should_skip_late_night_as_woke
-
-    def __init__(self, last_msg_at, wake_detected_at=0.0, last_device_at=0.0):
-        self._store = types.SimpleNamespace(last_user_message_at=last_msg_at)
-        self._last_wake_detected_at = wake_detected_at
-        self._last_device_activity_at = last_device_at
+# ----------------------------------------------------------- 밤잠 추론 (presence.Presence)
+def _make_presence(last_msg_at, wake_detected_at=0.0, last_device_at=0.0):
+    store = types.SimpleNamespace(last_user_message_at=last_msg_at)
+    p = Presence(store)
+    p._last_wake_detected_at = wake_detected_at
+    p._last_device_activity_at = last_device_at
+    return p
 
 
 class TestWakeInference:
     def test_silence_zero_when_unset(self):
-        assert _WakeApp(0.0)._user_silence_sec() == 0.0
+        assert _make_presence(0.0).user_silence_sec() == 0.0
 
     def test_silence_measures_gap(self):
-        app = _WakeApp(time.time() - 100.0)
-        assert 90.0 <= app._user_silence_sec() <= 200.0
+        p = _make_presence(time.time() - 100.0)
+        assert 90.0 <= p.user_silence_sec() <= 200.0
 
     def test_device_silence_inf_when_unset(self):
-        assert _WakeApp(0.0)._device_silence_sec() == float("inf")
+        assert _make_presence(0.0).device_silence_sec() == float("inf")
 
     def test_detect_wake_none_when_unset(self):
-        assert _WakeApp(0.0)._detect_wake_on_message() is None
+        assert _make_presence(0.0)._detect_wake() is None
 
     def test_detect_wake_none_when_gap_too_long(self):
         # 며칠(>MAX)이면 밤잠으로 안 봄 — 시간대와 무관하게 None
-        old = time.time() - (app_mod.WAKE_GAP_MAX_SEC + 3600.0)
-        assert _WakeApp(old)._detect_wake_on_message() is None
+        old = time.time() - (Presence.WAKE_GAP_MAX_SEC + 3600.0)
+        assert _make_presence(old)._detect_wake() is None
 
     def test_late_night_skipped_when_device_quiet_long(self):
         # 기기가 한참 잠잠하다 막 신호 = 자다 깸 → 늦은 밤 잔소리 보류
-        big = app_mod.WAKE_GAP_MIN_SEC + 600.0
-        assert _WakeApp(0.0)._should_skip_late_night_as_woke(big) is True
+        big = Presence.WAKE_GAP_MIN_SEC + 600.0
+        assert _make_presence(0.0).should_skip_late_night(big) is True
 
     def test_late_night_fires_when_device_recently_active(self):
         # 계속 폰 하던 중(기기 침묵 짧음) + 깸 감지 없음 → 밤새운 것 → 발사
-        app = _WakeApp(0.0, wake_detected_at=0.0)
-        assert app._should_skip_late_night_as_woke(120.0) is False
+        p = _make_presence(0.0, wake_detected_at=0.0)
+        assert p.should_skip_late_night(120.0) is False
 
     def test_late_night_skipped_right_after_wake_detected(self):
         # 메시지가 트리거보다 먼저 와 깸이 감지됐으면, 기기 침묵이 짧아도 보류
-        app = _WakeApp(0.0, wake_detected_at=time.time())
-        assert app._should_skip_late_night_as_woke(120.0) is True
+        p = _make_presence(0.0, wake_detected_at=time.time())
+        assert p.should_skip_late_night(120.0) is True
 
     def test_phone_screen_off_long_skips_even_if_device_active(self):
         # 폰이 '직전까지 화면 5시간 OFF' 보고 → 자다 깸(권위 신호) → 보류
-        app = _WakeApp(0.0)
-        big = app_mod.SLEEP_SCREEN_OFF_SEC + 600.0
-        assert app._should_skip_late_night_as_woke(0.0, screen_off_sec=big) is True
+        big = Presence.SLEEP_SCREEN_OFF_SEC + 600.0
+        assert _make_presence(0.0).should_skip_late_night(0.0, screen_off_sec=big) is True
 
     def test_phone_screen_off_short_fires_even_if_message_silent(self):
         # 폰이 '화면 OFF 0초'(계속 켜둠) 보고 → 밤샘 → 발사. 메시지 침묵이 길어도
         # 폰 신호가 권위라 휴리스틱 폴백 안 함.
-        app = _WakeApp(time.time() - 6 * 3600.0)
-        assert app._should_skip_late_night_as_woke(6 * 3600.0, screen_off_sec=0.0) is False
+        p = _make_presence(time.time() - 6 * 3600.0)
+        assert p.should_skip_late_night(6 * 3600.0, screen_off_sec=0.0) is False
+
+    def test_note_device_activity_returns_pre_update_silence(self):
+        # note_device_activity 는 *직전까지* 침묵을 돌려주고 시각을 갱신한다
+        p = _make_presence(0.0, last_device_at=time.time() - 200.0)
+        silence = p.note_device_activity()
+        assert 190.0 <= silence <= 300.0
+        assert p.device_silence_sec() < 5.0  # 갱신됨
+
+    def test_note_user_message_persists_and_detects(self):
+        # 긴 침묵(아침 시간대 가정 불가하므로 wake 판정은 None 일 수 있음) 후에도
+        # last_user_message_at 은 갱신되어야 한다
+        store = types.SimpleNamespace(last_user_message_at=0.0)
+        p = Presence(store)
+        p.note_user_message()
+        assert store.last_user_message_at > 0
 
 
 class TestMetaCheckin:

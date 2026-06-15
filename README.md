@@ -326,14 +326,15 @@ ENABLE_PC_TRACKER=false
 | `app_http.py` (143줄) | `TriggerHTTPHandler` + `HttpServerMixin` — `POST /trigger` · `GET /health` · `GET /weak_spots` |
 | `app_messaging.py` (281줄) | `MessagingMixin` — `_send` (짧은 backoff) · `_send_or_enqueue` · `_apply_message_side_effects` · retry 큐 워커 · 큐 모니터링 알림 · 톤 노트 |
 | `app_triggers.py` (307줄) | `TriggersMixin` — `_on_trigger` (로컬) · `handle_remote_trigger` (원격) · `_describe_trigger` · 복합 룰 평가 |
-| `app_loops.py` (363줄) | `LoopsMixin` — proactive · reminder · alarm · risk_predict · daily_journal · weekly_review · daily_restart 데몬 + 헬퍼 |
+| `app_loops.py` | `LoopsMixin` — proactive · reminder · alarm · risk_predict · daily_journal · weekly_review · daily_restart 데몬 + 헬퍼 |
+| `presence.py` | `Presence` — 수면/기상/활동 추론의 단일 주인 (밤잠 판정·야간 가드·기기 활동 신호 + 관련 임계 상수 한 곳). app/loops/triggers 가 위임 |
 | `trigger_satellite.py` | PC 위성 — Python Tracker + HTTP POST + 5분 간격 `/weak_spots` 동기화 |
 | `android-satellite/` | 폰 위성 — Android (Kotlin/Java), UsageEvents 기반 연속 세션 측정 |
 | `ai_engine.py` | `CoachAgent` — 에이전트 루프 · EXTRACT (별도 모델 분리 가능) · 비전 판독 · WOOP/회고/overload/risk_predict/daily_journal/pattern 분석 · `_call_genai` retry wrapper |
 | `agent_tools.py` | 도구 레지스트리 (17~19종) |
 | `tracker.py` | PC 활동 감시 + 9종 딴짓 트리거 (Pomodoro 포함) + 생산성 가드 + 화면 라벨 sanitize |
 | `store.py` | 상태 영속화 — 목표·습관·프로필·values·if-then·daily_stats (시간대 매핑 포함)·mood·events·weak_spot 후보·pending_messages 큐·dopamine_trails·nag_policy_temp |
-| `tests/` | pytest 단위 테스트 (80개) — store/tracker/복합 트리거/잔소리 응답·메타 체크인·무시 대응·밤잠 추론·성취 보상 |
+| `tests/` | pytest 단위 테스트 (82개) — store/tracker/복합 트리거/잔소리 응답·메타 체크인·무시 대응·밤잠 추론·성취 보상 |
 | `calendar_client.py` / `calendar_setup.py` | Google 캘린더 클라이언트 · OAuth 인증 |
 | `telegram_client.py` | 텔레그램 Bot API (long-polling) |
 | `Dockerfile` / `requirements-docker.txt` | Railway 클라우드 봇 빌드 |
@@ -390,7 +391,7 @@ ENABLE_PC_TRACKER=false
   - "늦은 밤" 잔소리: 자다 깬 직후(기기 잠잠하다 막 신호)면 보류, *계속 폰 하던 중*이면 그대로 발사 (밤샘은 잡아야 하니까)
   - 야간(0~7시) proactive: 기본 보류하되, *깨어있음이 명백*(최근 기기 활동)하면 "아직 안 자네?" 하고 자라고 챙긴다
 - **스몰스텝 성취감 보상** — 한 발 내디딜 때마다(sub_step·목표·습관) **진척 바(▰▰▱ 3/5)** + **누적 걸음 수**를 보여주며 짧게 축하. 누적 `lifetime_steps` 는 *절대 줄지 않고*(streak 처럼 끊겨 0 되는 부담 X), 10·25·50… 라운드 마일스톤마다 한 번 더 축하. 하루 마무리 일지·주간 회고에 "오늘/이번 주 N걸음" 결산. 카운트는 결정론적(store), 축하 톤은 LLM
-- 단위 테스트 80개 (store · tracker · 복합 트리거 · 잔소리 응답 · 메타 체크인 · 무시 대응 · 밤잠 추론 · 성취 보상)
+- 단위 테스트 82개 (store · tracker · 복합 트리거 · 잔소리 응답 · 메타 체크인 · 무시 대응 · 밤잠 추론 · 성취 보상)
 - `app.py` god class → `HttpServerMixin` · `MessagingMixin` · `TriggersMixin` · `LoopsMixin` 모듈 분리 (1583 → 601줄)
 
 백엔드는 이미 `POST /trigger` 한 엔드포인트로 모든 클라이언트를 받는 구조라, 새 디바이스 (스마트워치 등) 추가도 같은 패턴으로 가능.

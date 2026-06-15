@@ -646,15 +646,13 @@ class CoachAgent:
         with self._lock:
             return self._turn(f"[자동 감지] {description}")
 
-    def proactive_checkin(self) -> str:
+    def proactive_checkin(self, night: bool = False) -> str:
         """사용자가 한동안 조용할 때, 코치가 먼저 말을 거는 메시지를 생성한다.
         안 끝낸 오늘 목표가 있으면 그걸 콕 집어 챙기고, 다가오는 일정이 있으면
-        자연스럽게 한 번 상기시킨다 (강요 X)."""
+        자연스럽게 한 번 상기시킨다 (강요 X). night=True 면 야간에 깨어있음이
+        명백한 상황(app_loops 가 판단) — 할 일 채근 대신 자라고 챙기는 톤."""
         with self._lock:
-            # 야간(0~6시) proactive 는 '깨어있음이 명백할 때만'(폰 하느라 안 잠)
-            # 발사된다 (app_loops 의 야간 가드). → 할 일 채근이 아니라 슬슬 자라고
-            # 챙기는 쪽으로 전환.
-            if datetime.datetime.now().hour < 7:
+            if night:
                 return self._turn(
                     "[자동 트리거] 새벽인데 사용자가 안 자고 깨어 있어(기기 활동 감지). "
                     "다그치지 말고 '아직 안 자네?' 하고 슬슬 자라고 한마디 — 한두 문장, "

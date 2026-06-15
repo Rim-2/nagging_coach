@@ -93,8 +93,8 @@ class TriggersMixin:
     # ====================================================== 로컬 트리거 (PC Tracker 콜백)
     def _on_trigger(self, trigger: TriggerType, snap: Snapshot) -> None:
         """⚠️ Tracker 데몬 스레드에서 호출됨."""
-        # 기기 활동 시각 기록 — '깨어있음' 증거 (야간 proactive·밤잠 추론에 사용).
-        self._last_device_activity_at = time.time()
+        # 기기 활동 기록 — '깨어있음' 증거 (야간 proactive·밤잠 추론에 사용).
+        self._presence.note_device_activity()
         chat_id = self._store.chat_id
         if chat_id is None:
             self._tracker.resume_normal()
@@ -279,14 +279,10 @@ class TriggersMixin:
         if not trigger_value:
             return {"ok": False, "action": "skipped", "reason": "missing_trigger"}
 
-        # 기기 활동 시각 기록 — '깨어있음' 증거. 늦은 밤 판단엔 *이번 트리거
-        # 직전까지* 의 침묵이 필요하니, 갱신 전에 캡쳐해 둔다 (한참 잠잠하다 막
-        # 온 거면 자다 깸, 계속 오던 중이면 밤새 안 자는 것).
-        device_silence = (
-            (time.time() - self._last_device_activity_at)
-            if self._last_device_activity_at > 0 else float("inf")
-        )
-        self._last_device_activity_at = time.time()
+        # 기기 활동 기록 — '깨어있음' 증거. note_device_activity 가 *이번 트리거
+        # 직전까지* 의 기기 침묵을 돌려준다 (늦은 밤 판단용; 한참 잠잠하다 막 온
+        # 거면 자다 깸, 계속 오던 중이면 밤새 안 자는 것).
+        device_silence = self._presence.note_device_activity()
 
         # 폰 위성이 같이 보낸 디바이스 status (DND·충전·화면·걸음·헤드폰) 을
         # 최신값으로 store 에 보관 — state_summary·자기 격려 메시지에서 활용.
@@ -404,7 +400,7 @@ class TriggersMixin:
                     screen_off_sec = float(raw_off)
                 except (TypeError, ValueError):
                     screen_off_sec = None
-            if self._should_skip_late_night_as_woke(device_silence, screen_off_sec):
+            if self._presence.should_skip_late_night(device_silence, screen_off_sec):
                 print("[App] (원격) 늦은 밤 — 자다 깬 신호 → 수면 잔소리 보류")
                 return {"ok": True, "action": "skipped", "reason": "just_woke"}
             today_s = datetime.datetime.now().date().isoformat()
