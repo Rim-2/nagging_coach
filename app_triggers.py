@@ -21,6 +21,7 @@ from typing import Optional
 
 from ai_engine import AIGenerationError
 from app_http import PHONE_APP_LABELS
+from app_messaging import REMOTE_TRIGGER_COOLDOWN_SEC
 from tracker import Snapshot, TriggerType, sanitize_window_title
 
 
@@ -293,10 +294,23 @@ class TriggersMixin:
             except Exception as exc:
                 print(f"[App] phone_context 갱신 실패: {exc}")
 
-        # quiet_mode 활성 시 모든 잔소리 보류 (사용자 명시 선언 → 자동 발사 X)
-        if self._quiet_mode_block():
+        # quiet_mode 활성 시 모든 잔소리 보류 (사용자 명시 선언 → 자동 발사 X).
+        # 단, 위성이 같은 트리거를 매 분 POST 해도 보류 카운트는 trigger_value 별
+        # 10분 윈도우로 dedup — '실제로 보냈을 잔소리 수'에 맞춘다 (안 그러면
+        # idle/dwell 기반 트리거가 연발돼 카운트가 폭증). raw trigger_value 기준.
+        if self._store.quiet_mode:
+            now = time.time()
+            with self._remote_cooldown_lock:
+                first = now >= self._quiet_suppress_cooldowns.get(trigger_value, 0.0)
+                if first:
+                    self._quiet_suppress_cooldowns[trigger_value] = (
+                        now + REMOTE_TRIGGER_COOLDOWN_SEC
+                    )
+            if first:
+                self._store.bump_quiet_suppressed()
             print(
                 f"[App] (원격) 트리거 [{trigger_value}] quiet_mode 활성 — 보류"
+                + ("" if first else " (dedup)")
             )
             return {"ok": True, "action": "skipped", "reason": "quiet_mode"}
 

@@ -80,8 +80,6 @@ class LoopsMixin:
             chat_id = self._store.chat_id
             if chat_id is None:
                 continue
-            if self._quiet_mode_block():
-                continue
             # SLEEP(완료) 또는 WARNING(잔소리 중)이면 먼저 말 걸지 않는다.
             # Tracker 가 꺼져 있으면 상태 개념이 없으므로 그대로 진행한다.
             if self._tracker is not None and self._tracker.state != State.NORMAL:
@@ -95,6 +93,11 @@ class LoopsMixin:
             if now - self._last_proactive < self.PROACTIVE_IDLE_SEC:
                 continue
             self._last_proactive = now
+            # quiet_mode 체크는 idle gate 를 통과한 *여기서* — 실제로 먼저 말 걸
+            # 시점에만 보류 카운트를 올린다 (루프 tick 마다 세면 시간당 30건씩
+            # 폭증). last_proactive 를 이미 갱신했으니 보류해도 다음은 1시간 뒤.
+            if self._quiet_mode_block():
+                continue
             # 과부하 자체 점검 우선 — 시그널 충족하면 평소 프로액티브 대신
             # '톤·목표 점검' 메시지를 띄운다 (자기결정권 보존, 자동 적용 X).
             if self._should_check_overload(now):
@@ -280,8 +283,6 @@ class LoopsMixin:
                 continue
             if self._store.active_nag_policy == "gentle":
                 continue
-            if self._quiet_mode_block():
-                continue
             if self._store.risk_predict_already_fired_today():
                 continue
             now = datetime.datetime.now()
@@ -303,6 +304,11 @@ class LoopsMixin:
                     target = (int(h), int(c))
                     break
             if target is None:
+                continue
+            # quiet_mode 체크는 '실제로 발사할' 이 시점에서 — 보류해도 오늘 1회
+            # 발사한 걸로 마크해 5분마다 재시도/중복 카운트되는 걸 막는다.
+            if self._quiet_mode_block():
+                self._store.mark_risk_predict_fired(target[0])
                 continue
             weekly = self._store.weekly_summary(days=14)
             top_label = (weekly.get("recent") or {}).get("top_trigger") or "딴짓"
@@ -330,6 +336,9 @@ class LoopsMixin:
             if self._store.last_daily_journal == today_s:
                 continue
             if self._quiet_mode_block():
+                # 보류해도 오늘은 처리한 걸로 — 안 그러면 그 시각 내내 5분마다
+                # 다시 와서 보류 카운트가 ~12배로 부풀고, 해제 후 늦게 발사됨.
+                self._store.last_daily_journal = today_s
                 continue
             try:
                 reply = self._agent.daily_journal()
@@ -359,6 +368,8 @@ class LoopsMixin:
             if self._store.last_weekly_review == today_s:
                 continue
             if self._quiet_mode_block():
+                # 보류해도 오늘은 처리한 걸로 — 그 시각 내내 5분마다 재카운트 방지.
+                self._store.last_weekly_review = today_s
                 continue
             try:
                 reply = self._agent.weekly_review()

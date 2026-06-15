@@ -137,6 +137,10 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
         self._snooze_timer: Optional[threading.Timer] = None  # '좀따' 재알림 타이머
         self._remote_cooldowns: dict[str, float] = {}  # trigger_value → 다음 발동 가능 시각
         self._remote_cooldown_lock = threading.Lock()
+        # quiet_mode 중 보류 카운트 dedup — trigger_value → 다음 카운트 가능 시각.
+        # 위성이 같은 트리거를 매 분 POST 해도 '실제 보냈을 잔소리 수'만 세도록.
+        # 실제 쿨다운(_remote_cooldowns)과 분리해 해제 직후 잔소리를 막지 않는다.
+        self._quiet_suppress_cooldowns: dict[str, float] = {}
         # /reset 확인 쿠션 — 첫 명령은 안내 메시지, 60초 안에 같은 명령 한 번 더
         # 받아야 실제 실행. 사용자 사고 방지용. None 또는 {"kind", "at"}.
         self._pending_reset: Optional[dict] = None
