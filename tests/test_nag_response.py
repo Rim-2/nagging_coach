@@ -122,15 +122,17 @@ class TestEscalationNote:
 
 # ----------------------------------------------------------- 밤잠 추론
 class _WakeApp:
-    """밤잠 추론 헬퍼만 흉내 — store.last_user_message_at 페이크."""
+    """밤잠 추론 헬퍼만 흉내 — store.last_user_message_at + 기기 활동 시각 페이크."""
 
     _user_silence_sec = app_mod.CoachApp._user_silence_sec
+    _device_silence_sec = app_mod.CoachApp._device_silence_sec
     _detect_wake_on_message = app_mod.CoachApp._detect_wake_on_message
     _should_skip_late_night_as_woke = app_mod.CoachApp._should_skip_late_night_as_woke
 
-    def __init__(self, last_msg_at, wake_detected_at=0.0):
+    def __init__(self, last_msg_at, wake_detected_at=0.0, last_device_at=0.0):
         self._store = types.SimpleNamespace(last_user_message_at=last_msg_at)
         self._last_wake_detected_at = wake_detected_at
+        self._last_device_activity_at = last_device_at
 
 
 class TestWakeInference:
@@ -141,6 +143,9 @@ class TestWakeInference:
         app = _WakeApp(time.time() - 100.0)
         assert 90.0 <= app._user_silence_sec() <= 200.0
 
+    def test_device_silence_inf_when_unset(self):
+        assert _WakeApp(0.0)._device_silence_sec() == float("inf")
+
     def test_detect_wake_none_when_unset(self):
         assert _WakeApp(0.0)._detect_wake_on_message() is None
 
@@ -149,20 +154,20 @@ class TestWakeInference:
         old = time.time() - (app_mod.WAKE_GAP_MAX_SEC + 3600.0)
         assert _WakeApp(old)._detect_wake_on_message() is None
 
-    def test_late_night_skipped_after_long_silence(self):
-        # 한참 조용했으면(밤잠) 늦은 밤 잔소리 보류
-        app = _WakeApp(time.time() - (app_mod.WAKE_GAP_MIN_SEC + 600.0))
-        assert app._should_skip_late_night_as_woke() is True
+    def test_late_night_skipped_when_device_quiet_long(self):
+        # 기기가 한참 잠잠하다 막 신호 = 자다 깸 → 늦은 밤 잔소리 보류
+        big = app_mod.WAKE_GAP_MIN_SEC + 600.0
+        assert _WakeApp(0.0)._should_skip_late_night_as_woke(big) is True
 
-    def test_late_night_fires_when_recently_active(self):
-        # 방금까지 활동 중 + 깸 감지 없음 → 밤새운 것 → 잔소리 발사
-        app = _WakeApp(time.time() - 120.0, wake_detected_at=0.0)
-        assert app._should_skip_late_night_as_woke() is False
+    def test_late_night_fires_when_device_recently_active(self):
+        # 계속 폰 하던 중(기기 침묵 짧음) + 깸 감지 없음 → 밤새운 것 → 발사
+        app = _WakeApp(0.0, wake_detected_at=0.0)
+        assert app._should_skip_late_night_as_woke(120.0) is False
 
     def test_late_night_skipped_right_after_wake_detected(self):
-        # 메시지가 트리거보다 먼저 와 깸이 감지됐으면, 침묵이 짧아도 보류
-        app = _WakeApp(time.time() - 120.0, wake_detected_at=time.time())
-        assert app._should_skip_late_night_as_woke() is True
+        # 메시지가 트리거보다 먼저 와 깸이 감지됐으면, 기기 침묵이 짧아도 보류
+        app = _WakeApp(0.0, wake_detected_at=time.time())
+        assert app._should_skip_late_night_as_woke(120.0) is True
 
 
 class TestMetaCheckin:

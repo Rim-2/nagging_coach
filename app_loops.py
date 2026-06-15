@@ -48,9 +48,11 @@ class LoopsMixin:
     # 프로액티브 — 1시간 침묵 시 먼저 말 걸기
     PROACTIVE_IDLE_SEC = 3600.0
     PROACTIVE_CHECK_INTERVAL = 120.0
-    # 야간엔 먼저 말 걸지 않는다 (자는 시간 — 새벽 '뭐해' 핑 방지) [start, end)
+    # 야간엔 기본적으로 먼저 말 걸지 않는다 (자는 시간) [start, end). 단, 최근
+    # 기기 활동으로 '깨어있음'이 명백하면(폰 하느라 안 자는 중) 예외로 말 건다.
     PROACTIVE_NIGHT_START_HOUR = 0
     PROACTIVE_NIGHT_END_HOUR = 7
+    NIGHT_AWAKE_EVIDENCE_SEC = 3600.0   # 이 안에 기기 활동 있으면 '깨어있음'으로 봄
     # 일정 리마인더
     REMINDER_LEAD_MIN = 15.0
     REMINDER_CHECK_INTERVAL = 120.0
@@ -83,10 +85,14 @@ class LoopsMixin:
             chat_id = self._store.chat_id
             if chat_id is None:
                 continue
-            # 야간(자는 시간)엔 먼저 말 걸지 않는다 — 새벽 '뭐해 조용하네' 핑은
-            # 무의미하고 수면 방해. 늦은 밤 '자라' 잔소리는 별도 트리거가 담당.
+            # 야간(자는 시간)엔 기본 보류 — 단, 최근 기기 활동으로 '깨어있음'이
+            # 명백하면(폰 하느라 안 자는 중) 자라고 한마디 하러 먼저 말 건다.
+            # 자는 중(기기 잠잠)이면 그대로 보류해 수면 방해 안 함.
             hour = datetime.datetime.now().hour
-            if self.PROACTIVE_NIGHT_START_HOUR <= hour < self.PROACTIVE_NIGHT_END_HOUR:
+            if (
+                self.PROACTIVE_NIGHT_START_HOUR <= hour < self.PROACTIVE_NIGHT_END_HOUR
+                and self._device_silence_sec() >= self.NIGHT_AWAKE_EVIDENCE_SEC
+            ):
                 continue
             # SLEEP(완료) 또는 WARNING(잔소리 중)이면 먼저 말 걸지 않는다.
             # Tracker 가 꺼져 있으면 상태 개념이 없으므로 그대로 진행한다.

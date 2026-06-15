@@ -93,6 +93,8 @@ class TriggersMixin:
     # ====================================================== 로컬 트리거 (PC Tracker 콜백)
     def _on_trigger(self, trigger: TriggerType, snap: Snapshot) -> None:
         """⚠️ Tracker 데몬 스레드에서 호출됨."""
+        # 기기 활동 시각 기록 — '깨어있음' 증거 (야간 proactive·밤잠 추론에 사용).
+        self._last_device_activity_at = time.time()
         chat_id = self._store.chat_id
         if chat_id is None:
             self._tracker.resume_normal()
@@ -277,6 +279,15 @@ class TriggersMixin:
         if not trigger_value:
             return {"ok": False, "action": "skipped", "reason": "missing_trigger"}
 
+        # 기기 활동 시각 기록 — '깨어있음' 증거. 늦은 밤 판단엔 *이번 트리거
+        # 직전까지* 의 침묵이 필요하니, 갱신 전에 캡쳐해 둔다 (한참 잠잠하다 막
+        # 온 거면 자다 깸, 계속 오던 중이면 밤새 안 자는 것).
+        device_silence = (
+            (time.time() - self._last_device_activity_at)
+            if self._last_device_activity_at > 0 else float("inf")
+        )
+        self._last_device_activity_at = time.time()
+
         # 폰 위성이 같이 보낸 디바이스 status (DND·충전·화면·걸음·헤드폰) 을
         # 최신값으로 store 에 보관 — state_summary·자기 격려 메시지에서 활용.
         if device == "phone":
@@ -383,10 +394,10 @@ class TriggersMixin:
         # 늦은 밤 트리거 — 하루 한 번만. 위성 메모리 변수의 재시작 리셋을 막기
         # 위해 백엔드가 영속 마크로 차단 (트리거 종류별 10분 쿨다운보다 강한 제약).
         if trigger_value == "늦은 밤":
-            # 자다 깬 직후면 '안 자고 뭐해' 는 역효과 → 보류. 화면 켜서 트리거가
-            # 와도, 한참 조용했거나 방금 깸 감지됐으면 밤새운 게 아니라 깬 거.
-            if self._should_skip_late_night_as_woke():
-                print("[App] (원격) 늦은 밤 — 한참 조용했다 깬 신호 → 수면 잔소리 보류")
+            # 자다 깬 직후면 '안 자고 뭐해' 는 역효과 → 보류. 단, 계속 폰 하던
+            # 중(device_silence 짧음)이면 밤새 안 자는 거니 그대로 발사한다.
+            if self._should_skip_late_night_as_woke(device_silence):
+                print("[App] (원격) 늦은 밤 — 한참 잠잠하다 깬 신호 → 수면 잔소리 보류")
                 return {"ok": True, "action": "skipped", "reason": "just_woke"}
             today_s = datetime.datetime.now().date().isoformat()
             if self._store.last_late_night_fired == today_s:

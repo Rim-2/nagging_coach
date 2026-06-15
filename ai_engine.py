@@ -646,6 +646,15 @@ class CoachAgent:
         안 끝낸 오늘 목표가 있으면 그걸 콕 집어 챙기고, 다가오는 일정이 있으면
         자연스럽게 한 번 상기시킨다 (강요 X)."""
         with self._lock:
+            # 야간(0~6시) proactive 는 '깨어있음이 명백할 때만'(폰 하느라 안 잠)
+            # 발사된다 (app_loops 의 야간 가드). → 할 일 채근이 아니라 슬슬 자라고
+            # 챙기는 쪽으로 전환.
+            if datetime.datetime.now().hour < 7:
+                return self._turn(
+                    "[자동 트리거] 새벽인데 사용자가 안 자고 깨어 있어(기기 활동 감지). "
+                    "다그치지 말고 '아직 안 자네?' 하고 슬슬 자라고 한마디 — 한두 문장, "
+                    "따뜻하게. 할 일·목표 채근은 하지 마."
+                )
             goals = self._store.today_goals
             if goals:
                 goal_line = (

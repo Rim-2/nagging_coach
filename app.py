@@ -146,6 +146,7 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
         self._snooze_timer: Optional[threading.Timer] = None  # '좀따' 재알림 타이머
         self._pending_wake_check: Optional[int] = None  # 다음 chat flush 때 '자다 깸?' 물을지 (경과 시간)
         self._last_wake_detected_at = 0.0    # 마지막으로 '자다 깸' 감지한 시각 (늦은 밤 잔소리 억제용)
+        self._last_device_activity_at = 0.0  # 마지막 폰/PC 트리거 시각 — '깨어있음' 증거 (자는중 vs 폰하는중 구분)
         self._remote_cooldowns: dict[str, float] = {}  # trigger_value → 다음 발동 가능 시각
         self._remote_cooldown_lock = threading.Lock()
         # quiet_mode 중 보류 카운트 dedup — trigger_value → 다음 카운트 가능 시각.
@@ -633,28 +634,37 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
         last = self._store.last_user_message_at
         return max(0.0, time.time() - last) if last > 0 else 0.0
 
+    def _device_silence_sec(self) -> float:
+        """마지막 폰/PC 트리거(=기기 활동) 이후 경과(초). 기록 없으면 inf.
+        '기기가 한참 잠잠 = 화면 OFF = 자는 중' 을 가늠하는 신호. 짧으면
+        '폰 하느라 깨어 있음'."""
+        last = self._last_device_activity_at
+        return (time.time() - last) if last > 0 else float("inf")
+
     def _detect_wake_on_message(self) -> Optional[int]:
         """사용자 메시지 도착 *직전* 에 호출 (last_user_message_at 갱신 전).
-        직전 메시지 이후 경과가 밤잠 범위 + 아침 시간대면 '자다 깸' 으로 보고
-        경과 시간(시)을 반환 + 깸 시각 기록. 아니면 None."""
+        메시지 침묵이 밤잠 범위 + 아침 시간대 + 기기도 한참 잠잠(딴짓 중 아님)
+        이면 '자다 깸' 으로 보고 경과 시간(시) 반환 + 깸 시각 기록. 아니면 None."""
         gap = self._user_silence_sec()
-        if gap <= 0:
-            return None
-        if not (WAKE_GAP_MIN_SEC <= gap <= WAKE_GAP_MAX_SEC):
+        if gap <= 0 or not (WAKE_GAP_MIN_SEC <= gap <= WAKE_GAP_MAX_SEC):
             return None
         hour = time.localtime().tm_hour
         if not (MORNING_WAKE_START_HOUR <= hour < MORNING_WAKE_END_HOUR):
             return None
+        # 폰을 계속 쓰고 있었으면(딴짓) 자다 깬 게 아니다 — 묻지 않는다.
+        if self._device_silence_sec() <= WAKE_GAP_MIN_SEC:
+            return None
         self._last_wake_detected_at = time.time()
         return int(gap // 3600)
 
-    def _should_skip_late_night_as_woke(self) -> bool:
-        """'늦은 밤' 수면 잔소리 직전 호출. 방금 깸을 감지했거나(최근 grace 창)
-        한참 조용했으면(밤잠) True — 자다 깬 사람한테 '안 자고 뭐해' 는 역효과라
-        보류한다. 메시지/트리거 도착 순서와 무관하게 둘 중 하나로 잡힌다."""
+    def _should_skip_late_night_as_woke(self, device_silence_sec: float) -> bool:
+        """'늦은 밤' 수면 잔소리 직전 호출. 방금 깸을 감지했거나, *기기가 한참
+        잠잠하다가* 막 신호가 온 거면(자다 깸) True → 보류. 반대로 계속 폰 하던
+        중(device_silence 짧음)이면 False → 잔소리 발사 — 밤새 안 자는 케이스는
+        오히려 잡아야 하니까. device_silence 는 *이번 트리거 직전까지* 의 침묵."""
         if time.time() - self._last_wake_detected_at < WAKE_DETECTED_GRACE_SEC:
             return True
-        return self._user_silence_sec() > WAKE_GAP_MIN_SEC
+        return device_silence_sec > WAKE_GAP_MIN_SEC
 
     def _handle_chat(self, chat_id: int, text: str) -> None:
         """사용자 chat 메시지 도착 → 짧은 debounce 후 LLM 호출. 같은 debounce
