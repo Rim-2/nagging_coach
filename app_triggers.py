@@ -395,9 +395,17 @@ class TriggersMixin:
         # 위해 백엔드가 영속 마크로 차단 (트리거 종류별 10분 쿨다운보다 강한 제약).
         if trigger_value == "늦은 밤":
             # 자다 깬 직후면 '안 자고 뭐해' 는 역효과 → 보류. 단, 계속 폰 하던
-            # 중(device_silence 짧음)이면 밤새 안 자는 거니 그대로 발사한다.
-            if self._should_skip_late_night_as_woke(device_silence):
-                print("[App] (원격) 늦은 밤 — 한참 잠잠하다 깬 신호 → 수면 잔소리 보류")
+            # 중이면 밤새 안 자는 거니 그대로 발사한다. 폰이 보낸 screen_off_sec
+            # (직전까지 화면 OFF 지속)이 있으면 그게 가장 정확한 판단 근거.
+            raw_off = snap.get("screen_off_sec")
+            screen_off_sec: Optional[float] = None
+            if raw_off is not None:
+                try:
+                    screen_off_sec = float(raw_off)
+                except (TypeError, ValueError):
+                    screen_off_sec = None
+            if self._should_skip_late_night_as_woke(device_silence, screen_off_sec):
+                print("[App] (원격) 늦은 밤 — 자다 깬 신호 → 수면 잔소리 보류")
                 return {"ok": True, "action": "skipped", "reason": "just_woke"}
             today_s = datetime.datetime.now().date().isoformat()
             if self._store.last_late_night_fired == today_s:

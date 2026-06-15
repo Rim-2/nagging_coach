@@ -78,6 +78,9 @@ WAKE_GAP_MAX_SEC = 16 * 3600.0    # 너무 길면(며칠) 밤잠으로 안 봄
 MORNING_WAKE_START_HOUR = 4       # 자다 깬 걸로 볼 아침 시간대 [start, end)
 MORNING_WAKE_END_HOUR = 12
 WAKE_DETECTED_GRACE_SEC = 2 * 3600.0  # 깸 감지 후 '늦은 밤' 수면 잔소리 억제 창
+# 폰이 직접 보고한 '직전까지 화면 OFF 지속(screen_off_sec)' 이 이 이상이면 자다 깸.
+# (휴리스틱보다 정확 — 폰이 화면 OFF 길이를 트리거에 동봉. 구버전 APK 면 None.)
+SLEEP_SCREEN_OFF_SEC = 90 * 60.0
 AI_FAILURE_WARN_THRESHOLD = 3     # 연속 N회 실패 시 사용자에게 시스템 경고
 RESET_CONFIRM_TTL = 60.0          # /reset 첫 명령 후 N초 안에 한 번 더 보내야 실행
 CHAT_DEBOUNCE_SEC = 1.5           # 사용자 chat 짧은 간격 우다다 → 묶어서 한 번에 답장
@@ -657,13 +660,22 @@ class CoachApp(HttpServerMixin, MessagingMixin, TriggersMixin, LoopsMixin):
         self._last_wake_detected_at = time.time()
         return int(gap // 3600)
 
-    def _should_skip_late_night_as_woke(self, device_silence_sec: float) -> bool:
-        """'늦은 밤' 수면 잔소리 직전 호출. 방금 깸을 감지했거나, *기기가 한참
-        잠잠하다가* 막 신호가 온 거면(자다 깸) True → 보류. 반대로 계속 폰 하던
-        중(device_silence 짧음)이면 False → 잔소리 발사 — 밤새 안 자는 케이스는
-        오히려 잡아야 하니까. device_silence 는 *이번 트리거 직전까지* 의 침묵."""
+    def _should_skip_late_night_as_woke(
+        self, device_silence_sec: float, screen_off_sec: Optional[float] = None
+    ) -> bool:
+        """'늦은 밤' 수면 잔소리 직전 호출. 방금 깸을 감지했거나 자다 깬 직후면
+        True → 보류 (자는 사람한테 '안 자고 뭐해' 는 역효과). 계속 폰 하던 중이면
+        False → 발사 (밤샘은 잡아야 함).
+
+        판단 우선순위:
+          1) 아침 인사로 깸이 막 감지됨 → True
+          2) 폰이 직접 보고한 screen_off_sec 이 있으면 그게 가장 정확 — 임계 이상
+             이면 자다 깸(True), 짧으면 계속 폰 함(False)
+          3) 폰 신호 없으면(구버전 APK) 기기 침묵 휴리스틱 폴백"""
         if time.time() - self._last_wake_detected_at < WAKE_DETECTED_GRACE_SEC:
             return True
+        if screen_off_sec is not None:
+            return screen_off_sec >= SLEEP_SCREEN_OFF_SEC
         return device_silence_sec > WAKE_GAP_MIN_SEC
 
     def _handle_chat(self, chat_id: int, text: str) -> None:

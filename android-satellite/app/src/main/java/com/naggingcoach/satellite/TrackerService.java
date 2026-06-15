@@ -136,6 +136,14 @@ public class TrackerService extends Service {
     private int offStreakMin = 0;
     private String lateNightFiredOnDate = "";  // "yyyy-MM-dd"
 
+    // 자다 깸 판단용 — 화면 OFF→ON 전환 시 '켜지기 직전까지의 OFF 분'을 보존.
+    // 백엔드가 트리거 페이로드(screen_off_sec)로 받아 수면을 정확히 인식한다
+    // (별도 heartbeat 없이 기존 트리거에 동봉 → 배터리 비용 0).
+    private boolean lastScreenOn = true;
+    private int lastOffStreakMin = 0;          // 직전 OFF 구간 길이(분)
+    private long lastWakeAtMs = 0L;            // 마지막 OFF→ON 전환 시각
+    private static final long WAKE_REPORT_WINDOW_MS = 30 * 60_000L;  // 깬 뒤 이 동안 OFF길이 보고
+
     private final Runnable poller = new Runnable() {
         @Override
         public void run() {
@@ -308,6 +316,12 @@ public class TrackerService extends Service {
 
         // --- 화면 ON/OFF 누적 (휴식 없는 과로 + 늦은 밤 트리거 둘 다 씀) ---
         boolean screenOn = (pm != null) && pm.isInteractive();
+        // OFF→ON 전환: 켜지기 직전까지의 OFF 지속(분)을 보존 (자다 깸 판단용).
+        if (screenOn && !lastScreenOn) {
+            lastOffStreakMin = offStreakMin;
+            lastWakeAtMs = now;
+        }
+        lastScreenOn = screenOn;
         if (screenOn) {
             sustainedUseMin++;
             offStreakMin = 0;
@@ -471,6 +485,20 @@ public class TrackerService extends Service {
         return sb.toString();
     }
 
+    /** 자다 깸 판단용 — 화면이 (직전까지) 얼마나 OFF였는지(초). 현재 OFF면 진행
+     *  중 OFF 길이, 막 켜졌으면(최근 30분) 켜지기 직전 OFF 길이, 그 외 0.
+     *  백엔드가 이 값으로 '한참 자다 깸 vs 계속 폰 함' 을 정확히 구분한다. */
+    private long currentScreenOffSec(long now) {
+        boolean screenOn = (pm != null) && pm.isInteractive();
+        if (!screenOn) {
+            return offStreakMin * 60L;
+        }
+        if (lastWakeAtMs > 0 && (now - lastWakeAtMs) < WAKE_REPORT_WINDOW_MS) {
+            return lastOffStreakMin * 60L;
+        }
+        return 0L;
+    }
+
     private void tryFire(String triggerValue, String appPkg, long totalMs, long now) {
         String key = triggerValue + ":" + appPkg;
         Long last = lastFireMs.get(key);
@@ -483,13 +511,14 @@ public class TrackerService extends Service {
         final boolean dndActive = isDndActive();
         final boolean charging = isCharging();
         final boolean screenOn = (pm != null) && pm.isInteractive();
+        final long screenOffSec = currentScreenOffSec(now);
         final long stepsToday = getStepsToday();
         final boolean headphones = isHeadphonesConnected();
         final String placeCategory = matchPlaceCategory();   // null·"home"·"other" 등
         new Thread(() ->
             postTrigger(triggerValue, appPkg, totalMs,
                     dndActive, charging, screenOn, stepsToday, headphones,
-                    placeCategory)
+                    placeCategory, screenOffSec)
         ).start();
     }
 
@@ -661,7 +690,7 @@ public class TrackerService extends Service {
             String triggerValue, String appPkg, long totalMs,
             boolean dndActive, boolean charging, boolean screenOn,
             long stepsToday, boolean headphones,
-            String placeCategory) {
+            String placeCategory, long screenOffSec) {
         HttpURLConnection conn = null;
         try {
             URL url = new URL(BuildConfig.NAGGING_COACH_URL + "/trigger");
@@ -685,6 +714,7 @@ public class TrackerService extends Service {
             snap.append("\"dnd_active\":").append(dndActive).append(",");
             snap.append("\"charging\":").append(charging).append(",");
             snap.append("\"screen_on\":").append(screenOn);
+            snap.append(",\"screen_off_sec\":").append(screenOffSec);
             if (stepsToday >= 0) {
                 snap.append(",\"steps_today\":").append(stepsToday);
             }

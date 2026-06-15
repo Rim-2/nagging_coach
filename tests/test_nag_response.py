@@ -169,6 +169,18 @@ class TestWakeInference:
         app = _WakeApp(0.0, wake_detected_at=time.time())
         assert app._should_skip_late_night_as_woke(120.0) is True
 
+    def test_phone_screen_off_long_skips_even_if_device_active(self):
+        # 폰이 '직전까지 화면 5시간 OFF' 보고 → 자다 깸(권위 신호) → 보류
+        app = _WakeApp(0.0)
+        big = app_mod.SLEEP_SCREEN_OFF_SEC + 600.0
+        assert app._should_skip_late_night_as_woke(0.0, screen_off_sec=big) is True
+
+    def test_phone_screen_off_short_fires_even_if_message_silent(self):
+        # 폰이 '화면 OFF 0초'(계속 켜둠) 보고 → 밤샘 → 발사. 메시지 침묵이 길어도
+        # 폰 신호가 권위라 휴리스틱 폴백 안 함.
+        app = _WakeApp(time.time() - 6 * 3600.0)
+        assert app._should_skip_late_night_as_woke(6 * 3600.0, screen_off_sec=0.0) is False
+
 
 class TestMetaCheckin:
     def test_below_threshold_does_not_fire(self):
