@@ -1151,8 +1151,22 @@ class Store:
             return [dict(a) for a in self._data["alarms"]]
 
     def add_alarm(self, alarm: dict) -> None:
-        """알람 하나를 예약 목록에 추가한다."""
+        """알람 하나를 예약 목록에 추가한다. 같은 (text, repeat, label) 알람이
+        이미 있으면 *중복 추가 대신 교체* — 같은 알람을 두 번 등록해도 1개만
+        남아 같은 시각에 두 번 울리는 걸 막는다 (멱등). 기존에 중복이 쌓여 있어도
+        한 번 더 등록하면 하나로 합쳐진다."""
+        text = alarm.get("text")
+        repeat = alarm.get("repeat")
+        label = alarm.get("label")
         with self._lock:
+            self._data["alarms"] = [
+                a for a in self._data["alarms"]
+                if not (
+                    a.get("text") == text
+                    and a.get("repeat") == repeat
+                    and a.get("label") == label
+                )
+            ]
             self._data["alarms"].append(alarm)
             self._persist()
 

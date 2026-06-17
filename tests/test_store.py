@@ -273,3 +273,34 @@ class TestLifetimeSteps:
         fresh_store.advance_today_goal("코딩")
         rec = fresh_store.weekly_summary(days=7)["recent"]
         assert rec["sub_step_advances"] == 2
+
+
+# ----------------------------------------------------------- 알람 중복 방지
+class TestAlarmDedup:
+    def _daily(self, text, label="매일 10:00"):
+        return {"text": text, "repeat": "daily", "next_ts": 1.0, "label": label}
+
+    def test_same_alarm_added_twice_keeps_one(self, fresh_store):
+        fresh_store.add_alarm(self._daily("약 먹기"))
+        fresh_store.add_alarm(self._daily("약 먹기"))
+        alarms = fresh_store.alarms
+        assert len(alarms) == 1
+        assert alarms[0]["text"] == "약 먹기"
+
+    def test_distinct_alarms_same_time_both_kept(self, fresh_store):
+        # 같은 시각이라도 내용이 다르면 둘 다 유지
+        fresh_store.add_alarm(self._daily("약 먹기"))
+        fresh_store.add_alarm(self._daily("스트레칭"))
+        assert len(fresh_store.alarms) == 2
+
+    def test_readding_collapses_existing_duplicates(self, fresh_store):
+        # 이미 중복이 쌓여 있어도(과거 데이터) 한 번 더 등록하면 1개로 합쳐짐
+        fresh_store.replace_alarms([self._daily("약 먹기"), self._daily("약 먹기")])
+        assert len(fresh_store.alarms) == 2
+        fresh_store.add_alarm(self._daily("약 먹기"))
+        assert len(fresh_store.alarms) == 1
+
+    def test_different_time_kept_separate(self, fresh_store):
+        fresh_store.add_alarm(self._daily("약 먹기", label="매일 10:00"))
+        fresh_store.add_alarm(self._daily("약 먹기", label="매일 22:00"))
+        assert len(fresh_store.alarms) == 2

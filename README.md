@@ -334,7 +334,7 @@ ENABLE_PC_TRACKER=false
 | `agent_tools.py` | 도구 레지스트리 (17~19종) |
 | `tracker.py` | PC 활동 감시 + 9종 딴짓 트리거 (Pomodoro 포함) + 생산성 가드 + 화면 라벨 sanitize |
 | `store.py` | 상태 영속화 — 목표·습관·프로필·values·if-then·daily_stats (시간대 매핑 포함)·mood·events·weak_spot 후보·pending_messages 큐·dopamine_trails·nag_policy_temp |
-| `tests/` | pytest 단위 테스트 (82개) — store/tracker/복합 트리거/잔소리 응답·메타 체크인·무시 대응·밤잠 추론·성취 보상 |
+| `tests/` | pytest 단위 테스트 (86개) — store/tracker/복합 트리거/잔소리 응답·메타 체크인·무시 대응·밤잠 추론·성취 보상 |
 | `calendar_client.py` / `calendar_setup.py` | Google 캘린더 클라이언트 · OAuth 인증 |
 | `telegram_client.py` | 텔레그램 Bot API (long-polling) |
 | `Dockerfile` / `requirements-docker.txt` | Railway 클라우드 봇 빌드 |
@@ -391,7 +391,7 @@ ENABLE_PC_TRACKER=false
   - "늦은 밤" 잔소리: 자다 깬 직후(기기 잠잠하다 막 신호)면 보류, *계속 폰 하던 중*이면 그대로 발사 (밤샘은 잡아야 하니까)
   - 야간(0~7시) proactive: 기본 보류하되, *깨어있음이 명백*(최근 기기 활동)하면 "아직 안 자네?" 하고 자라고 챙긴다
 - **스몰스텝 성취감 보상** — 한 발 내디딜 때마다(sub_step·목표·습관) **진척 바(▰▰▱ 3/5)** + **누적 걸음 수**를 보여주며 짧게 축하. 누적 `lifetime_steps` 는 *절대 줄지 않고*(streak 처럼 끊겨 0 되는 부담 X), 10·25·50… 라운드 마일스톤마다 한 번 더 축하. 하루 마무리 일지·주간 회고에 "오늘/이번 주 N걸음" 결산. 카운트는 결정론적(store), 축하 톤은 LLM
-- 단위 테스트 82개 (store · tracker · 복합 트리거 · 잔소리 응답 · 메타 체크인 · 무시 대응 · 밤잠 추론 · 성취 보상)
+- 단위 테스트 86개 (store · tracker · 복합 트리거 · 잔소리 응답 · 메타 체크인 · 무시 대응 · 밤잠 추론 · 성취 보상)
 - `app.py` god class → `HttpServerMixin` · `MessagingMixin` · `TriggersMixin` · `LoopsMixin` 모듈 분리 (1583 → 601줄, 이후 기능 추가로 875줄)
 - 수면/기상/활동 추론을 `presence.Presence` 단일 주인으로 통합 — 흩어졌던 밤잠 판정·야간 가드·임계 상수를 한 곳으로 (시간대 정의 3중 중복 제거)
 
