@@ -56,7 +56,16 @@ class TelegramClient:
     ) -> bool:
         """텔레그램 메시지 발송. reply_markup 으로 inline_keyboard 부착 가능.
         예: reply_markup={"inline_keyboard": [[{"text": "😊", "callback_data": "mood:4"}, ...]]}
-        """
+
+        반환값 의미 (중복 발송 방지가 핵심):
+          True  = 보냈음 *또는 보냈을 수도 있음* → 재시도하지 마라.
+          False = *확실히 미도달* → 재시도 안전.
+
+        텔레그램 sendMessage 는 멱등키가 없어서, 도달했는데 응답만 못 받은 걸
+        '실패'로 보고 재시도하면 같은 메시지가 두 번 간다. 그래서 read timeout
+        (요청은 보냈는데 응답 지연)처럼 *모호한* 경우는 True 로 간주해 재시도를
+        막는다 (드물게 메시지 1건 유실 < 잦은 중복). 연결 자체 실패처럼 *확실히
+        미도달* 인 경우만 False 로 재시도를 허용한다."""
         try:
             params = {
                 "chat_id": chat_id,
@@ -66,6 +75,15 @@ class TelegramClient:
             if reply_markup is not None:
                 params["reply_markup"] = reply_markup
             self._call("sendMessage", params)
+            return True
+        except requests.exceptions.ConnectTimeout:
+            # 연결 단계 타임아웃 = 요청이 안 나갔다 → 미도달 → 재시도 안전.
+            print("[Telegram] 연결 타임아웃 (미도달) — 재시도 가능")
+            return False
+        except requests.exceptions.Timeout:
+            # read timeout 등 = 요청은 나갔는데 응답을 못 받음 → 도달했을 수 있음.
+            # 재시도하면 중복 위험 → '보낸 것'으로 간주.
+            print("[Telegram] 응답 타임아웃 — 도달했을 수 있어 재시도 안 함 (중복 방지)")
             return True
         except Exception as exc:
             print(f"[Telegram] 메시지 전송 실패: {exc}")
